@@ -1,0 +1,28 @@
+Subject: AWS EC2 to Azure VM Instance Comparison for Hybrid Cloud Architecture  
+
+Dear Team,  
+
+As part of our hybrid cloud strategy, I have compiled a comparison of AWS EC2 instances and their performance-equivalent Azure VMs. This analysis will help us evaluate cost-effectiveness when transitioning between cloud providers while maintaining compatibility and stability with our current AWS EC2 configurations.  
+
+The attached CSV file includes:  
+- A list of Azure VM alternatives for AWS EC2 instances.  
+- A comparison of On-Demand and Spot pricing for both Linux and Windows systems.  
+- To ensure compatibility with our existing AWS configurations, most instances include options for both Series 5 and the latest Series 6 Azure VMs.  
+
+This resource will serve as a reference for selecting the most suitable Azure VMs based on performance and pricing requirements.  
+
+Please let me know if you have any questions or need further details.  
+
+Best regards,  
+[Your Name]  
+
+---  
+**Key Features of the Translation:**  
+1. **Clarity and Conciseness:** The email is structured to clearly communicate the purpose and contents of the attached document.  
+2. **Technical Accuracy:** Terms like "On-Demand," "Spot pricing," "Series 5," and "Series 6" are accurately translated and contextually appropriate.  
+3. **Professional Tone:** The language is formal yet approachable, suitable for a professional audience.  
+4. **Logical Flow:** The email begins with the purpose, details the contents of the attachment, and concludes with an offer for further assistance.  
+
+Let me know if you would like to customize this further!
+
+For AWS i3en instances (storage-optimized for high-performance workloads), the Azure equivalent requires attaching correspondingly sized high-performance Managed Disks (such as Ultra Disks or Premium SSD v2) to achieve comparable storage performance and capacity.
