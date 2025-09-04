@@ -1,61 +1,53 @@
-{
-    "Profile": "[region]-[os]-[app]-[version]",
-    "UserData": "xxx",
-    "ExtraTags": [
-        {
-            "key": "project",
-            "value": "app"
-        },
-        {
-            "key": "owner",
-            "value": "app"
-        }
-    ],
-    "Distros": [
-        "snap-0e854c9fe04c4d9d2",
-        "app_name:fo_tir_20240816"
-    ],
-    "Alarms": [
-        {
-            "metric": "prc_cpu_worker",
-            "threshold": 2.0,
-            "datapointstoalarm": 5,
-            "evaluationperiods": 7,
-            "period": 60
-        },
-        {
-            "metric": "prc_cpu_executor",
-            "threshold": 2.0,
-            "datapointstoalarm": 5,
-            "evaluationperiods": 7,
-            "period": 60
-        }
-    ],
-    "InstanceTypes" : "r5.4xlarge,r6.4xlarge,r6i.4xlarge",
-    "InstanceRequirements": {
-        "VCpuCount": {
-            "min": 8,
-            "max": 32
-        },
-        "MemoryGib": {
-            "min": 64,
-            "max": 512
-        },
-        "MemoryGiBPerVCpu": {
-            "min": 8,
-            "max": 8
-        },
-        "ExcludedInstanceTypes": "string",
-        "AllowedInstanceTypes": "string"
-    },
-    "PrivateIpAddresses": [
-         "10.6.101.10",
-         "10.6.121.10"
-     ],
-     "TargetCapacity": {
-        "AllocationStrategy" : "",
-        "TotalCapacity": 5,
-        "CapacityType": "on_demand|spot",
-        "UnitType": "vcpu|vm"
-    }
-}
+Of course. Based on your precise clarification, here is the English explanation of the process flow.
+
+### Process Flow Analysis
+
+Your clarification is absolutely critical and correct. The process does not involve Aquila calling J5v3 directly. Instead, all API calls are routed through the Kong Gateway, which acts as a secure reverse proxy and single entry point.
+
+Here is the refined, accurate flow:
+
+---
+
+### Refined Process Steps
+
+The process consists of two main phases: first obtaining a token, and then using it to make authorized API calls through the gateway.
+
+#### Phase 1: Token Acquisition (Authentication)
+
+1.  Aquila Requests Token from Kong:
+       The Aquila service sends an HTTPS request to a specific authentication endpoint on the Kong Gateway (e.g., `/oauth2/token`).
+       It provides its credentials (e.g., `client_id` and `client_secret`) to prove its identity.
+
+2.  Kong Validates and Issues Token:
+       Kong receives the request. An authentication plugin (e.g., OAuth 2.0, JWT) validates Aquila's credentials.
+       If valid, Kong generates and returns an Access Token to Aquila.
+
+#### Phase 2: API Call via Gateway (Authorization & Proxy)
+
+3.  Aquila Calls the API through Kong:
+       Aquila needs to order or delete an instance by calling the J5v3 API.
+       Crucially, it does not call J5v3's internal address. Instead, it constructs a request to Kong's public API endpoint (e.g., `https://api.company.com/j5v3/instances`).
+       It places the received Access Token in the `Authorization` header of this request (e.g., `Authorization: Bearer <access_token>`).
+
+4.  Kong Validates the Token and Proxies the Request:
+       Kong receives the request destined for its `/j5v3` endpoint.
+       Routing: Kong identifies, based on the path, that this request should be routed to the upstream J5v3 service.
+       Authentication & Authorization: Before proxying, a Kong plugin (e.g., JWT, OAuth2) intercepts the request:
+           It validates the signature and expiry of the Access Token.
+           (Optional) It checks if the token has permissions to perform the specific action (e.g., `DELETE` on `/instances`).
+       Proxy: Only if all checks pass, Kong forwards the now-verified request to the actual, internal J5v3 service.
+
+5.  J5v3 Processes the Request:
+       J5v3 receives the request from Kong. It trusts that Kong has already handled authentication, so it can focus purely on business logic (e.g., deleting the instance).
+       It sends a response back to Kong, which is then relayed back to the original caller, Aquila.
+
+---
+
+### Architectural Significance (Why This Matters)
+
+This pattern is a cornerstone of modern microservices architecture:
+
+   Single Entry Point: Kong acts as the front door for all API traffic. No client needs to know the internal network addresses of backend services.
+   Decoupling: The Aquila service is completely decoupled from the J5v3 service. It only needs to know Kong's address. Changes to J5v3's location or implementation do not require updates to Aquila.
+   Centralized Security: Security policies (auth, rate limiting, logging) are enforced in one place (Kong), rather than being duplicated across every backend service like J5v3. This is more robust and easier to manage.
+   Client Consistency: For any client like Aquila, the method to call any service is identical: "Call the Kong endpoint and add the token."
