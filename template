@@ -1,0 +1,61 @@
+{
+    "Profile": "[region]-[os]-[app]-[version]",
+    "UserData": "xxx",
+    "ExtraTags": [
+        {
+            "key": "project",
+            "value": "app"
+        },
+        {
+            "key": "owner",
+            "value": "app"
+        }
+    ],
+    "Distros": [
+        "snap-0e854c9fe04c4d9d2",
+        "app_name:fo_tir_20240816"
+    ],
+    "Alarms": [
+        {
+            "metric": "prc_cpu_worker",
+            "threshold": 2.0,
+            "datapointstoalarm": 5,
+            "evaluationperiods": 7,
+            "period": 60
+        },
+        {
+            "metric": "prc_cpu_executor",
+            "threshold": 2.0,
+            "datapointstoalarm": 5,
+            "evaluationperiods": 7,
+            "period": 60
+        }
+    ],
+    "InstanceTypes" : "r5.4xlarge,r6.4xlarge,r6i.4xlarge",
+    "InstanceRequirements": {
+        "VCpuCount": {
+            "min": 8,
+            "max": 32
+        },
+        "MemoryGib": {
+            "min": 64,
+            "max": 512
+        },
+        "MemoryGiBPerVCpu": {
+            "min": 8,
+            "max": 8
+        },
+        "ExcludedInstanceTypes": "string",
+        "AllowedInstanceTypes": "string"
+    },
+    "PrivateIpAddresses": [
+         "10.6.101.10",
+         "10.6.121.10"
+     ],
+     "TargetCapacity": {
+        "AllocationStrategy" : "",
+        "TotalCapacity": 5,
+        "CapacityType": "on_demand|spot",
+        "UnitType": "vcpu|vm"
+    }
+}
