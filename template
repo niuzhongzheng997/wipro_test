@@ -1,227 +1,285 @@
-This is the implementation of the Aquila Instance Manager, which is a critical component that manages individual compute instances in the Aquila distributed computing system. Let me analyze this code in detail:
+-- Author: 1332491
+-- Created on: 12/6/2017 2:25:12 PM
+{-# LANGUAGE LambdaCase, GeneralizedNewtypeDeriving, RecordWildCards #-}
+module Cortex.Concurrent.Aquila.InstanceManager.JobDataManager
+    ( JobDataManagerConfig(..), defJDMConfig, defServerConfigEx
+    , Config(..), ConfigEx(..)
+    , allocateChild
+    , fetch, closure, task, exit
+    , main, start
+    ) where
 
-## Overall Purpose
+import Cortex.Concurrent.Aquila.Utils
+import Cortex.Concurrent.Aquila.Types
+import Cortex.Data.HTTP.Persistent
+import Cortex.Data.HTTP.Server
+import Cortex.Data.HTTP.Spawn.Client
+import Cortex.Data.HTTP.Spawn.Lite
+import Cortex.Data.HTTP.Spawn.Types
+import Cortex.Stem.Array(valueAnyIArray)
+import qualified Cortex.Concurrent.Aquila.JobManager.Client as JM
+import qualified Cortex.Data.HTTP.Mu as HTTP
+import qualified Cortex.Data.HTTP.Server.Config as Server
+import qualified Cortex.Stem.Core as Core
+import qualified Cortex.Stem.Stream.Mu as Stream
 
-The Aquila Instance Manager is responsible for:
-- Managing worker processes on individual compute nodes
-- Handling task execution and resource allocation
-- Communicating with Job Managers and other system components
-- Monitoring instance health and performance
-- Integrating with Trail service for monitoring
+import Control.Concurrent
+import Control.Concurrent.MVar
+import Control.Exception
+import Control.Monad
+import Data.Default
+import System.Console.CmdArgs.Explicit
 
-## Core Configuration
-
-### InstanceOptions - Configuration
-```haskell
-data InstanceOptions = InstanceOptions
-    { distsDir       :: Maybe String    -- Path to Cortex distribution archives
-    , installDir     :: Maybe String    -- Directory to install Cortex dists
-    , nWorkers       :: Int             -- Number of workers on this instance
-    , minFreeMem     :: Double          -- Minimum free memory for job allocation
-    , memoryLimit    :: Maybe Double    -- Memory limit for workers
-    , maxLifetime    :: Double          -- Max instance lifetime in seconds
-    , messageWait    :: Int             -- Wait time between messages (seconds)
-    , debugLevel     :: Debug           -- Debug level
-    , manager        :: (ManagerHost, ManagerPort)  -- Grid manager address
-    , distManager    :: Maybe (String, Int)         -- Distribution manager
-    , trail          :: Maybe (String, Int)         -- Trail service address
-    , lotId          :: String          -- Unique cloud order identifier
+data JobDataManagerConfig = JobDataManagerConfig
+    { serverConfigEx :: ConfigEx
+    , instanceManagerPort :: InstancePort
+    , instanceManagerId   :: InstanceManagerId
+    , nJDMs               :: Int
     }
-```
+    deriving (Show)
 
-## Server Configuration
-```haskell
-serverConfig :: Config
-serverConfig = def
-    { title = __MODULE__
-    , nThreads = 1024              -- Thread pool size
-    , backlog = Just 1024          -- Connection backlog
-    , maxQueued = Just 1024        -- Maximum queued requests
-    , port = 32200                 -- Default port
-    , reuseAddr = False
-    , safe = False
-    , core = POCO                  -- POCO networking core
-    , keepAliveConfig = Just KeepAlive
-        { keepAliveTimeout = 1 * 60  -- 1 minute keep-alive
-        , keepAliveRequests = 0      -- Unlimited requests
+instance Default JobDataManagerConfig where
+    def = defJDMConfig (JobDataManagerPort 42000) 128
+
+defJDMConfig :: JobDataManagerPort -> Int -> JobDataManagerConfig
+defJDMConfig jdmPort nJDMs = JobDataManagerConfig
+    { serverConfigEx = defServerConfigEx jdmPort nJDMs
+    , instanceManagerPort = InstancePort 32200 -- FIXME centralize default ports
+    , instanceManagerId = InstanceManagerId ""
+    , .. }
+
+defServerConfigEx :: JobDataManagerPort -> Int -> ConfigEx
+defServerConfigEx jdmPort nJDMs = def
+    { maxChildren = nJDMs
+    , childThreads = 1024
+    , config =  def
+        { safe = False
+        , nThreads = 1024
+        , backlog = Just 1024
+        , maxQueued = Just 1024
+        , port = unJobDataManagerPort jdmPort
+        , reuseAddr = False
+        , title = __MODULE__
+        , core = POCO
+        , keepAliveConfig = Just Server.KeepAlive
+            { keepAliveTimeout = 1 * 60 -- 1 minute
+            , keepAliveRequests = 0     -- infinity
+            }
         }
     }
-```
 
-## Key Initialization
+flags :: [Flag JobDataManagerConfig]
+flags =
+    [ flagReq ["instance-manager-id"]
+        (\s x -> Right (x{instanceManagerId=InstanceManagerId s}))
+        "STRING" "Instance Manager Id"
+    , flagReq ["instance-port"]
+        (\s x -> Right (x{ instanceManagerPort = InstancePort (read s)}))
+        "PORT" "Instance port number"
+    ]
 
-### Server Startup
-```haskell
-start :: Config -> InstanceOptions -> IO Server
-start cfg instOpts@InstanceOptions{..} = runServer cfg =<< do
-    checkArgs instOpts  -- Validate configuration
-    
-    -- Create instance state management
-    instanceState <- newInstance cfg instOpts
-    let instanceManagerId = instanceId instanceState
-        jdmPort = jdmParent instanceState
-        
-    -- Configure Job Data Manager
-    let jdmOpts = (JDM.defJDMConfig jdmPort nJDMs)
-            { JDM.instanceManagerId = instanceManagerId
-            , JDM.instanceManagerPort = InstancePort (port cfg) }
-    
-    -- Start Job Data Manager
-    let startJDM = do
-            putStrTs $ unwords ["Start JDM on", show jdmPort]
-            waitForServer =<< JDM.start jdmOpts
-    
-    -- Start JDM with crash recovery
-    forkIO $ crashRecover 60 startJDM
-    
-    -- Main control loop
-    forkIO $ forever $ try (masterControl instanceState) >>= \case
+heartbeat :: InstancePort -> InstanceManagerId -> IO ()
+heartbeat instancePort imid = void $ forkIO $ forever
+    $ backoff True 2 2.0 10.0 (verifyIMId instancePort imid) >>= \case
         Left e -> do
-            putStrTs $ unwords ["exception in master control thread:", e]
-            Core.exit 1
-        Right _ -> io $ Thread.sleep 5
-    
-    -- Trail service integration
-    whenJust trail . uncurry $ updateTrail instanceState lotId
-```
+            putStrTs $ unwords ["JDM heartbeat failed:", e ]
+            Core.exit 0
+        Right () -> do
+            threadDelay (5 * 1000 * 1000)
+            return ()
 
-## Background Services
+main :: IO ()
+main = liteServerMain __MODULE__ (serverConfigEx def) jobDataHandler flags
 
-### Trail Service Integration
-```haskell
-updateTrail instanceState lotId h p = do
-    conn <- io $ Trail.connect h p
-    (inst, usage) <- io $ Trail.mkInstanceInfo lotId
-    myIPAddress <- io Core.getIPAddress
-    
-    -- Register instance with Trail
-    tryWithMsg $ Trail.startInstance conn myIPAddress inst
-    
-    -- Background monitoring thread
-    void $ forkIO $ flip loopM (usage, []) $ \(usage, perfs) -> do
-        io $ Thread.sleep 5
-        tryWithMsg $ preemptCheck conn myIPAddress  -- Check for termination
-        updatePerf conn myIPAddress usage perfs     -- Update performance metrics
-```
+start :: JobDataManagerConfig -> IO Server
+start jdmCfg@JobDataManagerConfig{..} = do
+    heartbeat instanceManagerPort instanceManagerId
+    liteServer __MODULE__ serverConfigEx jobDataHandler jdmCfg
 
-### Preemption Check (Cloud Spot Instance)
-```haskell
-preemptCheck conn myIPAddr = do
-    -- AWS EC2 spot instance termination check
-    r <- try $ io $ HTTP.http_ [] HTTP.GET
-        "http://169.254.169.254/latest/meta-data/spot/termination-time" ""
-    case r of
-        Left e -> return ()
-        Right r -> case HTTP.responseCode r of
-            200 -> do  -- Termination notice received
-                terminationTime <- readTime $ HTTP.responseBody r
-                tryWithMsg $ stopInstance conn myIPAddr terminationTime
-            _ -> return ()
-```
+unpackTasks = Stream.unstreamValueByteString . unWrappedTaskArray
+unpackClosure = Stream.unstreamValueByteString . unWrappedClosure
 
-### Performance Monitoring
-```haskell
-updatePerf conn myIPAddress usage perfs = do
-    actives <- activeWorkers instanceState  -- Get active worker count
-    (perf, usage) <- io $ Trail.mkInstancePerf actives usage
-    
-    let perfs' = perf:perfs
-    if length perfs' > 6  -- Batch updates (30 seconds / 5 second intervals)
-    then do
-        tryWithMsg $ Trail.updateInstance conn $ map (myIPAddress,) perfs'
-        return (usage, [])
-    else
-        return (usage, perfs')
-```
+jobDataHandler :: JobDataManagerConfig
+               -> SessionToken -> String -> Int
+               -> IO (Handler ())
+jobDataHandler cfg@JobDataManagerConfig{..} token user myPort = do
+    usedVer <- io Core.version
+    putStrTs $ unwords [ "JobDataManager started on port", show myPort
+                       , "with config:", show cfg
+                       , "using Cortex version", usedVer ]
 
-## HTTP API Endpoints
+    inUse <- newMVar False
+    serverJobId <- newEmptyMVar
+    jobData <- newEmptyMVar
+    tasks <- newEmptyMVar
+    myAddr <- io Core.getIPAddress
 
-### 1. `/work` - Worker Task Handling
-```haskell
-"work" $/ postValue $ \r request ->
-    case (r ?& "jobhost", r ?& "jobport", r ?& "jobid", 
-          r ?& "workerid", r ?& "workerport") of
-        (Just jobHost, Just jobPort, Just jobId, 
-         Just workerId, Just workerPort) ->
-            responseObject . toAny <$> workerRequest
-                    instanceState
-                    (JobHost jobHost) (read jobPort) (JobId jobId)
-                    (WorkerId workerId) (read workerPort) request
-        otherwise -> printThenFail "work: missing required parameters"
-```
+    heartbeat instanceManagerPort instanceManagerId
 
-**Functionality:**
-- Handles worker task requests and submissions
-- Validates all required parameters
-- Routes to appropriate worker handling logic
+    let useOnce newJobId = modifyMVar_ inUse $ \inUse -> do
+            when inUse $ printThenFail $ unwords
+                [ "jobid", unJobId newJobId
+                , "JDM", show myPort, "is in use" ]
+            return True
 
-### 2. `/imid` - Instance Identity Verification
-```haskell
-"imid" $/ GET $. \r -> case r ?& "imid" of
-    Just imid -> if InstanceManagerId imid == instanceManagerId
-        then return . responseObject $ toAny ()  -- Identity confirmed
-        else printThenFail $ unwords ["imid: mismatch", "expected", instanceManagerId, "got", imid]
-    Nothing -> printThenFail "imid: missing parameter"
-```
+        gotJobData jd = do
+            putMVar jobData jd
+            putMVar tasks $ unpackTasks (snd jd)
 
-**Functionality:**
-- Verifies instance manager identity
-- Security check for inter-service communication
+        gotJDM newJobId jdm = do
+            putStrTs $ unwords
+                [ "jobid", unJobId newJobId
+                , "JDM", show myPort
+                , "is fetching from", show jdm ]
+            either (const Nothing) (const $ Just ())
+                <$> try (jdmJobData myAddr jdm newJobId >>= gotJobData)
 
-### 3. `/isjobvalid` - Job Validation
-```haskell
-"isjobvalid" $/ GET $. \r -> case r ?& "jobid" of
-    Just jobId -> return . responseObject . toAny
-                        =<< isJobValid instanceState (JobId jobId)
-    Nothing -> printThenFail "isjobvalid: missing jobid parameter"
-```
+        gotJDMs jobHost jobPort newJobId jdms
+            = firstJustM (gotJDM newJobId) jdms'
+                >>= maybe (printThenFail $ unwords
+                            [ "jobid", unJobId newJobId
+                            , "JDM", show myPort
+                            , "failed to download job data from"
+                            , show jdms' ])
+                          (const $ return ())
+            where
+            jdms' = jdms
+                    ++ [(JobDataManagerHost (unJobHost jobHost)
+                        ,JobDataManagerPort (unJobPort jobPort))]
 
-**Functionality:**
-- Checks if a job is still valid/running
-- Used by workers to validate task assignments
+    return $ do
+        "fetch" $/ postValue
+                $ \_ (FetchJobData (jobHost, jobPort, newJobId)) -> do
 
-### 4. `/exit` - Graceful Shutdown
-```haskell
-"exit" $/ GET $. \r -> do
-    Core.exit 0  -- Clean shutdown
-    return $ responseText "OK"
-```
+                    useOnce newJobId
 
-## Key Features
+                    putStrTs $ unwords
+                        [ "jobid", unJobId newJobId
+                        , "JDM", show myPort, "is fetching job data"]
 
-### 1. Resource Management
-- **Worker Allocation**: Manages `nWorkers` concurrent worker processes
-- **Memory Management**: Enforces `minFreeMem` and `memoryLimit` constraints
-- **Lifetime Control**: Supports `maxLifetime` for spot instances
+                    putMVar serverJobId newJobId
 
-### 2. Fault Tolerance
-- **Crash Recovery**: `crashRecover` mechanism for JDM restarts
-- **Exception Handling**: Comprehensive error handling throughout
-- **Preemption Detection**: Automatic cloud spot instance termination detection
+                    -- If "fetch" fails IM will kill this JDM
+                    either (gotJDMs jobHost jobPort newJobId)
+                           (gotJobData)
+                        =<< JM.jdms (jobHost, jobPort)
+                                newJobId instanceManagerId
+                                ( JobDataManagerHost myAddr
+                                , JobDataManagerPort myPort)
 
-### 3. Monitoring Integration
-- **Trail Service**: Real-time performance monitoring and reporting
-- **Health Checks**: Regular instance health verification
-- **Performance Metrics**: Continuous resource usage tracking
+                    return $ responseObject $ toAny ()
 
-### 4. Distributed Coordination
-- **Job Data Manager**: Manages distributed job data access
-- **Grid Manager Communication**: Coordinates with central management
-- **Worker Communication**: Handles task assignment and result collection
+        "closure" $/ GET $. \r -> do
+            serverJobId <- readMVar serverJobId
+            case r ?& "jobid" of
+                Just jobId -> if JobId jobId == serverJobId
+                    then responseObject . toAny . fst <$> readMVar jobData
+                    else printThenFail $ unwords
+                            [ "JDM", show myPort, "is expecting jobid"
+                            , unJobId serverJobId, "got:", jobId ]
+                _ -> printThenFail
+                        "JobDataManager: missing jobid argument in closure request"
 
-### 5. Cloud Integration
-- **Spot Instance Support**: Handles cloud spot instance lifecycles
-- **Lot Identification**: `lotId` for cloud order correlation
-- **Termination Handling**: Graceful shutdown on preemption
+        "task" $/ GET $. \r -> do
+            serverJobId <- readMVar serverJobId
+            case (r ?& "jobid", r?& "taskid") of
+                (Just jobId, Just taskId) -> if JobId jobId == serverJobId
+                    then responseObject . toAny
+                            . flip valueAnyIArray (read taskId)
+                            <$> readMVar tasks
+                    else printThenFail $ unwords
+                            [ "JDM", show myPort, "is expecting jobid"
+                            , unJobId serverJobId
+                            , "got:", jobId ]
+                _ -> printThenFail
+                        "JobDataManager: missing arguments in task request"
 
-## Configuration Validation
-```haskell
-checkArgs InstanceOptions{..} = do
-    when (isJust distsDir && isNothing installDir) $
-        fail "install-dir must be set if dists-dir is set"
-    
-    when (isJust distManager && not (isJust distsDir && isJust installDir)) $
-        fail "dists-dir and install-dir must be set if a dist-manager is used"
-```
+        "jobdata" $/ GET $. \r -> do
+            serverJobId <- readMVar serverJobId
+            case r ?& "jobid" of
+                Just jobId -> if JobId jobId == serverJobId
+                    then do
+                        -- FIXME put this under debug flag
+                        -- when (debug >= DebugNormal) $ do
+                        putStrTs $ unwords
+                            [ "jobid", unJobId serverJobId
+                            , "JDM", show myPort, "is serving job data" ]
+                        responseObject . toAny <$> readMVar jobData
+                    else printThenFail $ unwords
+                            [ "JobDataManager: expecting jobid"
+                            , unJobId serverJobId, "got:", jobId ]
+                _ -> printThenFail "JobDataManager: missing jobid argument\
+                                   \ in jobdata request"
 
-This Instance Manager is a sophisticated component that transforms raw compute instances into managed workers within the Aquila distributed computing system, providing robust resource management, fault tolerance, and cloud integration capabilities.
+
+-- Client
+
+newtype FetchJobData = FetchJobData (JobHost, JobPort, JobId)
+    deriving (HasType)
+
+fetch :: JobDataManagerPort -> JobHost -> JobPort -> JobId -> IO ()
+fetch jdPort jobHost jobPort jobId = do
+    handle <- io clientHandle
+    post handle url (FetchJobData (jobHost, jobPort, jobId)) [] opts
+    where
+    opts = noproxy |+| TimeOut (30 * 60) |+| KeepAlive False
+    url = mconcat
+            [ "http://127.0.0.1:", show (unJobDataManagerPort jdPort)
+            , "/fetch" ]
+
+closure :: JobDataManagerPort -> JobId -> IO (Object IFunction)
+closure jdPort jobId = do
+    handle <- io clientHandle
+    unpackClosure <$> get handle url [] opts
+    where
+    opts = noproxy |+| TimeOut (30 * 60) |+| KeepAlive False
+    url = mconcat
+            [ "http://127.0.0.1:", show (unJobDataManagerPort jdPort)
+            , "/closure"
+            , "?jobid=", unJobId jobId ]
+
+task :: JobDataManagerPort -> JobId -> TaskId -> IO (Object IAny)
+task jdPort jobId taskId = do
+    handle <- io clientHandle
+    get handle url [] opts
+    where
+    opts = noproxy |+| TimeOut (30 * 60) |+| KeepAlive False
+    url = mconcat
+            [ "http://127.0.0.1:", show (unJobDataManagerPort jdPort)
+            , "/task"
+            , "?jobid=", unJobId jobId
+            , "&taskid=", show (unTaskId taskId) ]
+
+exit :: JobDataManagerPort  -> IO ()
+exit jdPort = void $ try $ io
+    $ HTTP.http [HTTP.proxy "", HTTP.timeout 300] HTTP.GET
+        ("http://127.0.0.1:" & show (unJobDataManagerPort jdPort) & "/exit") ""
+
+verifyIMId
+    :: InstancePort
+    -> InstanceManagerId
+    -> IO ()
+verifyIMId instancePort imid = do
+    handle <- io clientHandle
+    get handle url [] opts
+    where
+    opts = noproxy |+| TimeOut (1 * 60) |+| KeepAlive False
+    url = mconcat [ "http://127.0.0.1:", show instancePort
+                  , "/imid?"
+                  , "imid=" & unInstanceManagerId imid
+                  ]
+
+jdmJobData :: String
+           -> (JobDataManagerHost, JobDataManagerPort)
+           -> JobId
+           -> IO (WrappedClosure, WrappedTaskArray)
+jdmJobData myAddr (host, port) jobId = do
+    handle <- io clientHandle
+    get handle url [] opts
+    where
+    opts = noproxy |+| TimeOut (2 * 60) |+| KeepAlive False
+    url = mconcat [ "http://", unJobDataManagerHost host
+                  , ":", show (unJobDataManagerPort port)
+                  , "/jobdata"
+                  , "?jobid=" & unJobId jobId
+                  , "&inst=" & myAddr ]
