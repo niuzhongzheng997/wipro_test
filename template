@@ -1,212 +1,214 @@
-{-|
-This is Aquila Worker.
+This is the implementation of the Aquila Worker, which is the actual computation unit that executes tasks in the Aquila distributed computing system. Let me analyze this code in detail:
 
-For more details on Aquila see "Cortex.Concurrent.Aquila"
--}
-{-# LANGUAGE RecordWildCards #-}
-module Cortex.Concurrent.Aquila.Worker(
-    main
-) where
+## Overall Purpose
 
-import Control.Alternative((<|>))
-import Control.Concurrent
-import Control.Concurrent.MVar
-import Control.Monad
-import Control.Exception
-import Data.Default
-import Data.Maybe(isNothing)
-import System.Console.CmdArgs.Explicit
+The Aquila Worker is responsible for:
+- Executing individual computation tasks
+- Managing task lifecycle and resource usage
+- Communicating with Instance Manager for task assignments
+- Handling task results and reporting
+- Monitoring job status and memory usage
 
-import Cortex.Concurrent.Aquila.InstanceManager.Types
-import Cortex.Concurrent.Aquila.Types
-import Cortex.Concurrent.Aquila.Utils
-import Cortex.Data.HTTP.Persistent
-import Cortex.Data.HTTP.Server
-import Cortex.Stem.Core.ProcInfo
-import qualified Cortex.Concurrent.Aquila.InstanceManager.Client as InstanceManager
-import qualified Cortex.Stem.Core as Core
-import qualified Cortex.Stem.Fun as Fun
-import qualified Cortex.Stem.Stream.Mu as Stream
-import qualified Cortex.Stem.Thread.Mu as Thread
+## Core Configuration
 
+### WorkerOptions - Configuration
+```haskell
 data WorkerOptions = WorkerOptions
-    { worker_id           :: WorkerId
-    , worker_instancePort :: InstancePort
-    , worker_debug        :: Debug
-    , worker_jobId        :: JobId
-    , worker_jobAddr      :: JobHost
-    , worker_jobPort      :: JobPort
-    , worker_memLimit     :: Maybe Double
-    } deriving (Show)
+    { worker_id           :: WorkerId        -- Unique worker identifier
+    , worker_instancePort :: InstancePort    -- Instance Manager port
+    , worker_debug        :: Debug           -- Debug level
+    , worker_jobId        :: JobId           -- Job identifier
+    , worker_jobAddr      :: JobHost         -- Job Manager host
+    , worker_jobPort      :: JobPort         -- Job Manager port
+    , worker_memLimit     :: Maybe Double    -- Memory usage limit
+    }
+```
 
+### Default Configuration
+```haskell
 instance Default WorkerOptions where
     def = WorkerOptions
             { worker_id = WorkerId "no-worker"
-            , worker_instancePort = InstancePort 32200
+            , worker_instancePort = InstancePort 32200  -- Default Instance Manager port
             , worker_debug = DebugNormal
             , worker_jobId = JobId "none"
             , worker_jobAddr = JobHost "127.0.0.1"
-            , worker_jobPort = JobPort 32001
+            , worker_jobPort = JobPort 32001           -- Default Job Manager port
             , worker_memLimit = Nothing }
+```
 
+## Server Configuration
+```haskell
 serverConfig :: Config
 serverConfig = def
     { title = __MODULE__
-    , nThreads = 8
-    , port = 32210
+    , nThreads = 8              -- Smaller thread pool for workers
+    , port = 32210              -- Default worker port
     , reuseAddr = False
     , safe = False
     , core = POCO
     }
+```
 
-main :: IO ()
-main = serverMain start "Worker" serverConfig
-    [flagReq ["worker-id"] (\s x -> Right ( x { worker_id = WorkerId s }))
-        "STRING" "Worker id"
-    ,flagReq ["instance-port"] (\s x -> Right ( x { worker_instancePort=read s } ))
-        "PORT" "Port number of Instance manager"
-    ,flagReq ["debug"] (\s x -> Right ( x { worker_debug = read s } ))
-        "DEBUG" "Debug level"
-    ,flagReq ["job-id"] (\s x -> Right ( x { worker_jobId=JobId s } ))
-        "STRING" "Job id"
-    ,flagReq ["job-host"] (\s x -> Right ( x { worker_jobAddr=JobHost s } ))
-        "HOST" "Hostname/IP of Job manager"
-    ,flagReq ["job-port"] (\s x -> Right ( x { worker_jobPort=read s } ))
-        "PORT" "Port number of Job manager"
-    ,flagReq ["memory-limit"] (\s x -> Right (x{worker_memLimit=Just (read s)}))
-        "DOUBLE" "Worker process exits if memory usage exceeds this number when not processing tasks"
-    ]
+## Key Initialization
 
+### Server Startup
+```haskell
 start :: Config -> WorkerOptions -> IO Server
 start cfg opts@WorkerOptions{..} = runServer cfg =<< do
+    exitSignal <- newEmptyMVar  -- Signal for graceful shutdown
 
-    exitSignal <- newEmptyMVar
-
-    -- main work thread
+    -- Main work thread
     forkIO $ do
         handle <- io clientHandle
-        tryWithMsg
-            $ flip loopM (Nothing, Nothing) $ uncurry
+        tryWithMsg $ flip loopM (Nothing, Nothing) $ uncurry
             $ processTask exitSignal cfg opts handle
-        -- if above throws, e.g. bad_alloc, exit
+        -- If above throws (e.g., bad_alloc), exit
         void $ tryPutMVar exitSignal 1
 
-    -- job status monitoring
+    -- Job status monitoring thread
     forkIO $ do
         handle <- io clientHandle
         forever $ do
             statusMonitor exitSignal cfg opts handle
-            io $ Thread.sleep 30
+            io $ Thread.sleep 30  -- Check every 30 seconds
 
+    -- Exit handler thread
     forkIO $ do
         tryWithMsg (takeMVar exitSignal >>= Core.exit)
-        -- if above throws, e.g. bad_alloc, just exit
+        -- If above throws, just exit
         Core.exit 1
+```
 
-    return $ do
-        "ping" $/ GET $. \r -> responseText "pong"
-        "exit" $/ GET $. \r -> do
-            putStrLn "Exit requested"
-            forkIO $ do
-                io $ Thread.sleep 5
-                Core.exit 0
-            return $ responseText "OK"
+## Core Functionality
 
+### 1. Status Monitoring
+```haskell
 statusMonitor exitSignal cfg WorkerOptions{..} handle = do
-    backoff True 2 2.0 10.0
+    backoff True 2 2.0 10.0  -- Retry with backoff
         (InstanceManager.isJobValid handle worker_instancePort worker_jobId)
       >>= either (gotError exitSignal worker_id workerPort worker_jobId)
                  (gotStatus)
     where
     workerPort = WorkerPort $ port cfg
-    gotStatus b = unless b $ do
-        putStrTs $ unwords
-            [ "jobid", unJobId worker_jobId
-            , "worker", unWorkerId worker_id
-            , "on port", show workerPort
-            , "failed to verify job status" ]
+    gotStatus b = unless b $ do  -- If job is invalid, exit
+        putStrTs $ unwords ["jobid", unJobId worker_jobId, "worker", ...]
         void $ tryPutMVar exitSignal 1
+```
 
+### 2. Task Processing Loop
+```haskell
 processTask exitSignal cfg WorkerOptions{..} handle closure prev = do
     let needClosure = isNothing closure
-        prevResult = fmap f prev where
+        prevResult = fmap f prev where  -- Prepare previous result
             f (tid, info, r) = (tid, (info, WrappedResult $ Stream.streamValueByteString r))
-        workRequest = timeIt (worker_debug >= DebugNormal)
-                             (unwords
-                                [ "jobid", unJobId worker_jobId
-                                , "worker", unWorkerId worker_id
-                                , "on port", show workerPort
-                                , "task request" ])
-            $ do
-                requestNewTask <- case worker_memLimit of
-                    Nothing -> return True
-                    Just limit -> do
-                        usage <- io Core.peakUsage
-                        if usage > limit
-                        then do
-                            putStrTs $ unwords
-                                [ "jobid", unJobId worker_jobId
-                                , "worker", unWorkerId worker_id
-                                , "on port", show workerPort
-                                , "peak memory usage", show usage
-                                , "exceeds limit", show limit ]
-                            return False
-                        else do
-                            putStrTs $ unwords
-                                [ "jobid", unJobId worker_jobId
-                                , "worker", unWorkerId worker_id
-                                , "on port", show workerPort
-                                , "peak memory usage", show usage
-                                , "within limit", show limit ]
-                            return True
-                InstanceManager.work
-                    worker_id
-                    handle worker_instancePort
-                    worker_jobAddr worker_jobPort worker_jobId workerPort
-                    WorkerRequest {..}
-    when (worker_debug >= DebugLoud) $ putStrTs $ unwords
-            [ "jobid", unJobId worker_jobId
-            , "worker", unWorkerId worker_id
-            , "on port", show workerPort
-            , "is getting task"
-            , if needClosure then "and closure" else "" ]
-    try workRequest
-        >>= either (gotError exitSignal worker_id workerPort worker_jobId)
-                   (gotWork closure)
-    where
-    workerPort = WorkerPort $ port cfg
-    gotWork _ (Nothing, _) = do
-        putStrTs $ unwords
-            [ "jobid", unJobId worker_jobId
-            , "worker", unWorkerId worker_id
-            , "on port", show workerPort
-            , "found no work" ]
-        tryPutMVar exitSignal 0
-        return $ Right ()
-    gotWork closure (Just (tid, arg), closure') = do
-        when (worker_debug >= DebugNormal) $ putStrTs $ unwords
-            [ "jobid", unJobId worker_jobId
-            , "worker", unWorkerId worker_id
-            , "on port", show workerPort
-            , "now runs task", show tid ]
-        cls <- case closure' <|> closure of
-            Nothing -> do
-                tryPutMVar exitSignal 1
-                fail $ unwords
-                    [ "jobid", unJobId worker_jobId
-                    , "worker", unWorkerId worker_id
-                    , "on port", show workerPort
-                    , "found no closure" ]
-            Just cls -> return cls
-        let (res, info) = evalWithInfo
-                            Nothing
-                            (Fun.try1 (Core.applyAny cls))
-                            arg
-        return $ Left (Just cls, Just (tid, info, res))
+        
+        -- Memory limit check
+        workRequest = timeIt (worker_debug >= DebugNormal) "task request" $ do
+            requestNewTask <- case worker_memLimit of
+                Nothing -> return True
+                Just limit -> do
+                    usage <- io Core.peakUsage
+                    if usage > limit
+                    then do  -- Memory exceeded, don't request new task
+                        putStrTs $ unwords ["peak memory usage", show usage, "exceeds limit", show limit]
+                        return False
+                    else do  -- Memory within limits
+                        putStrTs $ unwords ["peak memory usage", show usage, "within limit", show limit]
+                        return True
+            
+            -- Request work from Instance Manager
+            InstanceManager.work worker_id handle worker_instancePort
+                worker_jobAddr worker_jobPort worker_jobId workerPort
+                WorkerRequest {..}
 
+    -- Request and process work
+    try workRequest >>= either (gotError exitSignal worker_id workerPort worker_jobId)
+                               (gotWork closure)
+```
+
+### 3. Work Handling
+```haskell
+gotWork closure (Just (tid, arg), closure') = do
+    when (worker_debug >= DebugNormal) $ putStrTs $ unwords
+        [ "jobid", unJobId worker_jobId, "worker", unWorkerId worker_id, ...]
+    
+    -- Get closure function
+    cls <- case closure' <|> closure of
+        Nothing -> do  -- No closure available, exit
+            tryPutMVar exitSignal 1
+            fail $ unwords ["found no closure"]
+        Just cls -> return cls
+    
+    -- Execute the task
+    let (res, info) = evalWithInfo Nothing (Fun.try1 (Core.applyAny cls)) arg
+    
+    return $ Left (Just cls, Just (tid, info, res))  -- Continue loop with result
+
+gotWork _ (Nothing, _) = do  -- No work available, exit gracefully
+    putStrTs $ unwords ["found no work"]
+    tryPutMVar exitSignal 0
+    return $ Right ()  -- Break loop
+```
+
+## HTTP API Endpoints
+
+### 1. `/ping` - Health Check
+```haskell
+"ping" $/ GET $. \r -> responseText "pong"
+```
+
+### 2. `/exit` - Graceful Shutdown
+```haskell
+"exit" $/ GET $. \r -> do
+    putStrLn "Exit requested"
+    forkIO $ do
+        io $ Thread.sleep 5
+        Core.exit 0
+    return $ responseText "OK"
+```
+
+## Error Handling
+```haskell
 gotError exitSignal worker_id workerPort worker_jobId err = do
-    tryPutMVar exitSignal 1
-    fail $ unwords
-        [ "jobid", unJobId worker_jobId
-        , "worker", unWorkerId worker_id
-        , "on port", show workerPort, "failed:", err ]
+    tryPutMVar exitSignal 1  -- Signal error exit
+    fail $ unwords ["jobid", unJobId worker_jobId, "worker", ... "failed:", err]
+```
+
+## Key Features
+
+### 1. Task Execution
+- **Closure Application**: Applies closure functions to task arguments
+- **Result Packaging**: Wraps results in stream-encoded format
+- **Performance Info**: Collects execution metrics and timing information
+
+### 2. Resource Management
+- **Memory Monitoring**: Checks peak memory usage against limits
+- **Graceful Degradation**: Stops requesting work if memory limits exceeded
+- **Clean Exit**: Proper shutdown procedures
+
+### 3. Fault Tolerance
+- **Status Verification**: Regularly checks if job is still valid
+- **Error Recovery**: Backoff retry mechanism for network issues
+- **Exception Handling**: Comprehensive error handling throughout
+
+### 4. Performance Optimization
+- **Closure Caching**: Reuses closure functions across tasks
+- **Stream Encoding**: Efficient result serialization
+- **Debug Logging**: Configurable verbose logging
+
+### 5. Communication Patterns
+- **Work Request**: Polls Instance Manager for new tasks
+- **Result Submission**: Sends completed task results back
+- **Heartbeat**: Regular status updates and health checks
+
+## Workflow
+
+1. **Initialization**: Worker starts with specific job configuration
+2. **Status Check**: Verifies job is still valid and active
+3. **Work Request**: Asks Instance Manager for next task
+4. **Task Execution**: Applies closure to task arguments
+5. **Result Handling**: Packages and returns results
+6. **Loop Continuation**: Continues processing or exits gracefully
+
+This Worker implementation is a robust, self-contained computation unit that efficiently executes tasks while managing resources and maintaining communication with the broader Aquila distributed computing system.
