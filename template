@@ -1,129 +1,204 @@
-{-|
-This is Aquila Dist Manager.
+This is the implementation of the Aquila Distribution Manager (DistManager), which is responsible for managing and distributing Cortex runtime environments. Let me analyze this code in detail:
 
-For more details on Aquila see "Cortex.Concurrent.Aquila"
--}
-module Cortex.Concurrent.Aquila.DistManager
-    ( main
-    , DistManagerOptions(..), start, serverConfig, flags
-    ) where
+## Overall Purpose
 
-import Control.Concurrent.QSem
+The Aquila Dist Manager serves as a distribution server that:
+- Manages Cortex runtime distribution archives
+- Provides version discovery and listing
+- Handles distribution file downloads
+- Controls concurrent download access
 
-import Cortex.Data.HTTP.Server as Server
-import Cortex.Data.Regex as Regex
-import Cortex.Stem.Thread.Mu as Thread
-import qualified Cortex.Stem.Core as Core
+## Core Configuration
 
-import System.Directory as Dir
-import System.Console.CmdArgs.Explicit
-
-import Control.Monad
-import Control.Concurrent
-import Control.Concurrent.MVar
-import Data.Default
-import qualified Cortex.Data.Version as Version
-import qualified Cortex.Data.String.Mu as Str
-import qualified Cortex.Temporal.Date as Date
-
-import Cortex.Data.JSON.Mu
-
+### DistManagerOptions - Configuration
+```haskell
 data DistManagerOptions = DistManagerOptions
-    { distManager_cortexDists :: String
-    , maxConcurrentDownloads :: Int
-    } deriving (Show)
+    { distManager_cortexDists :: String  -- Path to distribution archives
+    , maxConcurrentDownloads :: Int      -- Maximum concurrent downloads
+    }
+```
 
-
+### Default Configuration
+```haskell
 instance Default DistManagerOptions where
     def = DistManagerOptions
-        { distManager_cortexDists = "./"
-        , maxConcurrentDownloads = 30
+        { distManager_cortexDists = "./"  -- Current directory by default
+        , maxConcurrentDownloads = 30     -- 30 concurrent downloads
         }
+```
 
+## Server Configuration
+```haskell
 serverConfig :: Server.Config
 serverConfig = def
     { title = __MODULE__
-    , nThreads = 1024
-    , backlog = Just 1024
-    , maxQueued = Just 1024
-    , port = 31998
+    , nThreads = 1024              -- Thread pool size
+    , backlog = Just 1024          -- Connection backlog
+    , maxQueued = Just 1024        -- Maximum queued requests
+    , port = 31998                 -- Default port
     , reuseAddr = False
     , safe = False
-    , core = POCO
+    , core = POCO                  -- POCO networking core
     , keepAliveConfig = Nothing
     }
+```
 
-flags :: [Flag DistManagerOptions]
-flags =
-    [ flagReq ["dists"]
-        (\s x -> Right (x {distManager_cortexDists=s}))
-        "PATH" "Path to Cortex distribution archives"
-    , flagReq ["max-downloads"]
-        (\s x -> Right (x {maxConcurrentDownloads= read s}))
-        "INT" "Max concurrent downloads"
-    ]
+## Key Initialization
 
-main :: IO ()
-main = serverMain start "DistManager" serverConfig flags
-
+### Server Startup
+```haskell
 start :: Server.Config -> DistManagerOptions -> IO Server
 start cfg opts = runServer cfg =<< do
-
     let dists_dir = distManager_cortexDists opts
-
+    
+    -- MVar to store available distributions
     dists :: MVar [String] <- newMVar []
-
-    -- Search for dists
+    
+    -- Function to check for available distributions
     let checkDists = do
           dir_exists <- Dir.doesDirectoryExist dists_dir
           dir_files <- if dir_exists
               then Dir.getDirectoryContents dists_dir
               else return []
-          let re = Regex.create "(.*)\\.tar\\.gz" -- FIXME "(.*)\\.tar\\.gz$"
+          -- Regex pattern to match .tar.gz files
+          let re = Regex.create "(.*)\\.tar\\.gz"
               matches = map (\x -> Regex.searchEx re x) dir_files
               matches' = filter (\l -> length l == 2) matches
           modifyMVar_ dists $ \d -> do
-              let d' = map (!!1) matches'
+              let d' = map (!!1) matches'  -- Extract version names
               when (d /= d') $ do
                   putStrLn $ "Available distributions: " & Str.intercalate ", " d'
               return d'
-
+    
+    -- Initial scan for distributions
     checkDists
-
+    
+    -- Background thread to periodically check for new distributions
     forkIO $ forever $ do
         checkDists
-        io $ Thread.sleep 20
-
+        io $ Thread.sleep 20  -- Check every 20 seconds
+    
+    -- Semaphore to limit concurrent downloads
     downloadsLimit <- newQSem $ maxConcurrentDownloads opts
-
+    
     tod <- io Date.today
     return $ do
-        "available" $/ GET $. \r ->
-            case (r ?& "format") of
-                (Just format) | format == "json"
-                  -> responseJSON . encode . toJSON <$> readMVar dists
-                otherwise
-                  -> responseObject . toAny <$> readMVar dists
-        "dist" $/ GET $. \r -> withQSem downloadsLimit $
-            case (r ?& "version") of
-                (Just version) -> do
-                    dists' <- readMVar dists
-                    if version `elem` dists'
-                    then return $ Server.download (dists_dir & "/" & version & ".tar.gz") Nothing
-                    else fail $ "Invalid version " & version
-                otherwise -> do
-                    fail "Invalid arguments"
+        -- HTTP handlers defined here
+```
 
-        "ping" $/ GET $. \_ -> do
-            v <- io Core.versionLong
-            return $ responseObject
-                   $ toAny
-                   $ fromMaybe (if "head"`Str.isPrefixOf`v
-                                then Version.Version tod (" ("&v&")") ""
-                                else Version.Version (Date.date 1900 01 01)
-                                                     "s000000" "(unreal)")
-                               (Version.parseVersion v)
+## HTTP API Endpoints
 
-        "exit" $/ GET $. \r -> do
-            Core.exit 0
-            return $ responseText "OK"
+### 1. `/available` - List Available Distributions
+```haskell
+"available" $/ GET $. \r ->
+    case (r ?& "format") of
+        (Just format) | format == "json"
+          -> responseJSON . encode . toJSON <$> readMVar dists  -- JSON response
+        otherwise
+          -> responseObject . toAny <$> readMVar dists  -- Default response
+```
+
+**Functionality:**
+- Returns list of available Cortex distributions
+- Supports both JSON and default response formats
+- Reads from the shared `dists` MVar
+
+### 2. `/dist` - Download Distribution
+```haskell
+"dist" $/ GET $. \r -> withQSem downloadsLimit $  -- Rate limiting
+    case (r ?& "version") of
+        (Just version) -> do
+            dists' <- readMVar dists
+            if version `elem` dists'  -- Validate version exists
+            then return $ Server.download (dists_dir & "/" & version & ".tar.gz") Nothing
+            else fail $ "Invalid version " & version
+        otherwise -> do
+            fail "Invalid arguments"
+```
+
+**Functionality:**
+- Downloads specific distribution version
+- Uses `withQSem` to limit concurrent downloads
+- Validates version existence before serving file
+- Returns the actual `.tar.gz` file for download
+
+### 3. `/ping` - Service Health Check
+```haskell
+"ping" $/ GET $. \_ -> do
+    v <- io Core.versionLong
+    return $ responseObject
+           $ toAny
+           $ fromMaybe (if "head"`Str.isPrefixOf`v
+                        then Version.Version tod (" ("&v&")") ""  -- Development version
+                        else Version.Version (Date.date 1900 01 01)  -- Fallback version
+                                                 "s000000" "(unreal)")
+                       (Version.parseVersion v)
+```
+
+**Functionality:**
+- Returns version information for health checking
+- Handles both release and development versions
+- Provides fallback version if parsing fails
+
+### 4. `/exit` - Server Shutdown
+```haskell
+"exit" $/ GET $. \r -> do
+    Core.exit 0  -- Terminate the server
+    return $ responseText "OK"
+```
+
+## Key Features
+
+### 1. Distribution Management
+- **Automatic Discovery**: Scans directory for `.tar.gz` files periodically
+- **Version Tracking**: Maintains list of available distributions in shared state
+- **File Serving**: Efficiently serves distribution archives
+
+### 2. Concurrency Control
+- **Rate Limiting**: Uses `QSem` to limit concurrent downloads (default: 30)
+- **Thread Safety**: Uses `MVar` for safe concurrent access to distribution list
+
+### 3. Background Maintenance
+- **Periodic Scanning**: Background thread checks for new distributions every 20 seconds
+- **Dynamic Updates**: Automatically detects new distribution files
+
+### 4. Error Handling
+- **Version Validation**: Checks if requested version exists before serving
+- **Directory Existence**: Verifies distribution directory exists
+- **Graceful Fallbacks**: Handles missing directories and parsing errors
+
+### 5. API Flexibility
+- **Multiple Formats**: Supports both JSON and native response formats
+- **Version Parsing**: Handles different version string formats
+- **Health Monitoring**: Provides ping endpoint for service monitoring
+
+## File Naming Convention
+
+The system expects distribution files to follow the pattern:
+```
+{version_name}.tar.gz
+```
+
+For example:
+- `cortex-2.1.0.tar.gz`
+- `production-release.tar.gz`
+- `development-snapshot.tar.gz`
+
+## Usage Example
+
+1. **List available versions**:
+   ```bash
+   curl http://localhost:31998/available
+   ```
+
+2. **Download specific version**:
+   ```bash
+   curl http://localhost:31998/dist?version=cortex-2.1.0 -o cortex-2.1.0.tar.gz
+   ```
+
+3. **Check service health**:
+   ```bash
+   curl http://localhost:31998/ping
+   ```
+
+This DistManager is a crucial component for managing runtime environments in the Aquila distributed computing system, ensuring that compute nodes can access the required Cortex distributions efficiently and reliably.
