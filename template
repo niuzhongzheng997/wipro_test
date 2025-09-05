@@ -1,204 +1,223 @@
-This is the implementation of the Aquila Distribution Manager (DistManager), which is responsible for managing and distributing Cortex runtime environments. Let me analyze this code in detail:
+{-|
+This is Aquila Instance Manager.
 
-## Overall Purpose
+For more details on Aquila see "Cortex.Concurrent.Aquila"
+-}
+{-# LANGUAGE LambdaCase, RecordWildCards #-}
+module Cortex.Concurrent.Aquila.InstanceManager
+    ( main
+    , InstanceOptions(..), serverConfig, flags, start
+    ) where
 
-The Aquila Dist Manager serves as a distribution server that:
-- Manages Cortex runtime distribution archives
-- Provides version discovery and listing
-- Handles distribution file downloads
-- Controls concurrent download access
+import Control.Monad
+import Control.Concurrent
+import Control.Exception
+import Data.Maybe(isJust, isNothing)
+import System.Console.CmdArgs.Explicit
 
-## Core Configuration
+import Cortex.Data.HTTP.Server
+import Cortex.Data.HTTP.Server.Config
+import Cortex.Concurrent.Aquila.InstanceManager.Internal
+import Cortex.Concurrent.Aquila.InstanceManager.Types
+import Cortex.Concurrent.Aquila.Types
+import Cortex.Concurrent.Aquila.Utils
+import Cortex.Temporal.Date.Mu(now, readDatetimeWithFormat)
+import qualified Cortex.Concurrent.Aquila.InstanceManager.JobDataManager as JDM
+import qualified Cortex.Concurrent.Aquila.Trail.Client as Trail
+import qualified Cortex.Concurrent.Aquila.Trail.Utils as Trail
+import qualified Cortex.Data.HTTP.Mu as HTTP
+import qualified Cortex.Stem.Core as Core
+import qualified Cortex.Stem.Thread.Mu as Thread
 
-### DistManagerOptions - Configuration
-```haskell
-data DistManagerOptions = DistManagerOptions
-    { distManager_cortexDists :: String  -- Path to distribution archives
-    , maxConcurrentDownloads :: Int      -- Maximum concurrent downloads
-    }
-```
-
-### Default Configuration
-```haskell
-instance Default DistManagerOptions where
-    def = DistManagerOptions
-        { distManager_cortexDists = "./"  -- Current directory by default
-        , maxConcurrentDownloads = 30     -- 30 concurrent downloads
-        }
-```
-
-## Server Configuration
-```haskell
-serverConfig :: Server.Config
+serverConfig :: Config
 serverConfig = def
     { title = __MODULE__
-    , nThreads = 1024              -- Thread pool size
-    , backlog = Just 1024          -- Connection backlog
-    , maxQueued = Just 1024        -- Maximum queued requests
-    , port = 31998                 -- Default port
+    , nThreads = 1024
+    , backlog = Just 1024
+    , maxQueued = Just 1024
+    , port = 32200
     , reuseAddr = False
     , safe = False
-    , core = POCO                  -- POCO networking core
-    , keepAliveConfig = Nothing
+    , core = POCO
+    , keepAliveConfig = Just KeepAlive
+        { keepAliveTimeout = 1 * 60 -- 1 minute
+        , keepAliveRequests = 0     -- infinity
+        }
     }
-```
 
-## Key Initialization
+flags :: [Flag InstanceOptions]
+flags =
+    [ flagReq ["dists"] (\s x -> Right (x { distsDir = Just s} ))
+        "PATH" "Path to Cortex distribution archives"
+    , flagReq ["install-dir"] (\s x -> Right (x { installDir = Just s} ))
+        "PATH" "Directory to install Cortex dists"
+    , flagReq ["slots"] (\s x -> Right (x { nWorkers = read s} ))
+        "INT" "Number of workers on this instance"
+    , flagReq ["min-free-memory"] (\s x -> Right x{minFreeMem=read s})
+        "DOUBLE" "Minimum number of free bytes to send job allocation request"
+    , flagReq ["memory-limit"] (\s x -> Right x{memoryLimit=Just (read s)})
+        "DOUBLE" "At-rest memory limit for workers"
+    , flagReq ["max-lifetime"] (\s x -> Right (x { maxLifetime = read s } ))
+        "DOUBLE" "Max lifetime in seconds. 0 for spot, n*3600 for n-hour spot block. Default to infinity."
+    , flagReq ["wait"] (\s x -> Right (x { messageWait = fromInt $ read s} ))
+        "INT" "Number of seconds to wait between messages to job manager"
+    , flagReq ["debug"] (\s x -> Right ( x { debugLevel = read s } ))
+        "DEBUG" "Debug level"
+    , flagReq ["manager"] (\s x -> Right (x { manager = parseManager s} ))
+        "HOST:PORT" "grid manager host:port"
+    , flagReq ["dist-manager"] (\s x -> Right (x { distManager = hp' s }))
+        "HOST:PORT" "dist manager host:port"
+    , flagReq ["trail"] (\s x -> Right (x { trail = hp' s }))
+        "HOST:PORT" "trail host:port"
+    , flagReq ["lot-id"] (\s x -> Right (x{lotId=s}))
+        "STRING" "unique identifier to relate to cloud order id"
+    ]
+    where
+    hp' = Just . hostPortPair
 
-### Server Startup
-```haskell
-start :: Server.Config -> DistManagerOptions -> IO Server
-start cfg opts = runServer cfg =<< do
-    let dists_dir = distManager_cortexDists opts
-    
-    -- MVar to store available distributions
-    dists :: MVar [String] <- newMVar []
-    
-    -- Function to check for available distributions
-    let checkDists = do
-          dir_exists <- Dir.doesDirectoryExist dists_dir
-          dir_files <- if dir_exists
-              then Dir.getDirectoryContents dists_dir
-              else return []
-          -- Regex pattern to match .tar.gz files
-          let re = Regex.create "(.*)\\.tar\\.gz"
-              matches = map (\x -> Regex.searchEx re x) dir_files
-              matches' = filter (\l -> length l == 2) matches
-          modifyMVar_ dists $ \d -> do
-              let d' = map (!!1) matches'  -- Extract version names
-              when (d /= d') $ do
-                  putStrLn $ "Available distributions: " & Str.intercalate ", " d'
-              return d'
-    
-    -- Initial scan for distributions
-    checkDists
-    
-    -- Background thread to periodically check for new distributions
-    forkIO $ forever $ do
-        checkDists
-        io $ Thread.sleep 20  -- Check every 20 seconds
-    
-    -- Semaphore to limit concurrent downloads
-    downloadsLimit <- newQSem $ maxConcurrentDownloads opts
-    
-    tod <- io Date.today
+main :: IO ()
+main = serverMain start "InstanceManager" serverConfig flags
+
+checkArgs InstanceOptions{..} = do
+    when (isJust distsDir && isNothing installDir) $
+        fail "install-dir must be set if dists-dir is set"
+
+    when (isJust distManager && not (isJust distsDir && isJust installDir)) $
+        fail "dists-dir and install-dir must be set if a dist-manager is used"
+
+updateTrail instanceState lotId h p = do
+    conn <- io $ Trail.connect h p
+    (inst, usage) <- io $ Trail.mkInstanceInfo lotId
+    myIPAddress <- io Core.getIPAddress
+
+    tryWithMsg $ Trail.startInstance conn myIPAddress inst
+
+    void $ forkIO $ flip loopM (usage, []) $ \(usage, perfs) -> do
+        io $ Thread.sleep 5
+        tryWithMsg $ preemptCheck conn myIPAddress
+        updatePerf conn myIPAddress usage perfs
+
+    where
+
+    preemptCheck conn myIPAddr
+        = either (const $ return ()) term =<< getTerminationNotice =<< io now
+        where
+        getTerminationNotice now = do -- FIXME take a vendor parameter for this
+            r <- try $ io $ HTTP.http_
+                [] HTTP.GET
+                "http://169.254.169.254/latest/meta-data/spot/termination-time"
+                ""
+            return $ case r of
+                Left e -> Left e
+                Right r -> case HTTP.responseCode r of
+                    200 -> Right $ readTime $ HTTP.responseBody r
+                    x -> Left $ unwords ["got error code", show x]
+            where
+            readTime = either (const now) id
+                     . readDatetimeWithFormat (Just "yyyy-mm-ddThh:nn:ssZ")
+        -- TODO update job manager
+        term = tryWithMsg . stopInstance conn myIPAddr
+        stopInstance conn myIPAddr instanceStopped = tryWithMsg
+            $ Trail.stopInstance conn myIPAddr
+                Trail.InstanceStop { termination = Trail.Terminated, ..}
+
+    updatePerf conn myIPAddress usage perfs = do
+        actives <- activeWorkers instanceState
+        (perf, usage) <- io $ Trail.mkInstancePerf actives usage
+        let perfs' = perf:perfs
+        if length perfs' > 30 `div` 5
+        then do
+            tryWithMsg $ Trail.updateInstance conn
+                       $ map (myIPAddress,) perfs'
+            return $ Left (usage, [])
+        else
+            return $ Left (usage, perfs')
+
+{-
+checkInstanceMemory inst = do
+    avail <- instanceAvailMem inst
+    reserved <- instanceReservedMem inst
+    let total = instanceTotalMem inst
+    putStrTs $ unwords [ "instance memory:", show ( sipFormat total 0
+                                                  , sipFormat reserved 0
+                                                  , sipFormat avail 0 ) ]
+    when (avail < 0) $ do
+        putStrTs "available memory is negative. Exiting..."
+        Core.exit 1
+{-
+    when (abs (reserved + avail - total) > 0.05 * total) $ do
+        -- allowing some margin for accumulated arithmetic errors ...
+        putStrTs "reserved plus avail exceeding total memory. Exiting..."
+        Core.exit 2
+-}
+
+-}
+
+start :: Config -> InstanceOptions -> IO Server
+start cfg instOpts@InstanceOptions{..} = runServer cfg =<< do
+
+    checkArgs instOpts
+
+    instanceState <- newInstance cfg instOpts
+    let instanceManagerId = instanceId instanceState
+        jdmPort = jdmParent instanceState
+        jdmOpts = (JDM.defJDMConfig jdmPort nJDMs)
+            { JDM.instanceManagerId = instanceManagerId
+            , JDM.instanceManagerPort = InstancePort (port cfg) }
+
+        startJDM = do
+            putStrTs $ unwords
+                [ "Start JDM on", show (unJobDataManagerPort jdmPort)
+                , "for", unInstanceManagerId instanceManagerId ]
+            waitForServer =<< JDM.start jdmOpts
+
+    putStrTs $ unwords
+        [ "InstMan starting on port", show (port cfg)
+        , "with instance id", unInstanceManagerId instanceManagerId
+        , "with JDM on", show (unJobDataManagerPort jdmPort) ]
+
+    -- Start JobDataManager and keep it running
+    forkIO $ crashRecover 60 startJDM
+
+    forkIO $ forever $ try (masterControl instanceState) >>= \case
+        Left e -> do
+            putStrTs $ unwords ["exception in master control thread:", e ]
+            putStrTs "exiting"
+            Core.exit 1
+        Right _ -> do
+            io $ Thread.sleep 5
+            return ()
+
+    -- thread to keep Trail updated
+    whenJust trail . uncurry $ updateTrail instanceState lotId
+
     return $ do
-        -- HTTP handlers defined here
-```
+        "work" $/ postValue $ \r request ->
+            case (r ?& "jobhost", r ?& "jobport", r ?& "jobid", r ?& "workerid", r ?& "workerport") of
+                (Just jobHost, Just jobPort, Just jobId, Just workerId, Just workerPort) ->
+                    responseObject . toAny
+                        <$> workerRequest
+                                instanceState
+                                (JobHost jobHost) (read jobPort) (JobId jobId)
+                                (WorkerId workerId) (read workerPort) request
+                otherwise -> printThenFail $ unwords
+                        [ "work: missing required parameters." ]
 
-## HTTP API Endpoints
+        "imid" $/ GET $. \r -> case r ?& "imid" of
+            Just imid -> if InstanceManagerId imid == instanceManagerId
+                then return . responseObject $ toAny ()
+                else printThenFail $ unwords
+                    [ "imid: expecting imid", unInstanceManagerId instanceManagerId
+                    , "got", imid ]
+            Nothing -> printThenFail $ unwords
+                    [ "imid: expecting imid", unInstanceManagerId instanceManagerId
+                    , "got Nothing"]
 
-### 1. `/available` - List Available Distributions
-```haskell
-"available" $/ GET $. \r ->
-    case (r ?& "format") of
-        (Just format) | format == "json"
-          -> responseJSON . encode . toJSON <$> readMVar dists  -- JSON response
-        otherwise
-          -> responseObject . toAny <$> readMVar dists  -- Default response
-```
+        "isjobvalid" $/ GET $. \r -> case r ?& "jobid" of
+            Just jobId -> return . responseObject . toAny
+                                =<< isJobValid instanceState (JobId jobId)
+            Nothing -> printThenFail "isjobvalid: missing jobid parameter"
 
-**Functionality:**
-- Returns list of available Cortex distributions
-- Supports both JSON and default response formats
-- Reads from the shared `dists` MVar
-
-### 2. `/dist` - Download Distribution
-```haskell
-"dist" $/ GET $. \r -> withQSem downloadsLimit $  -- Rate limiting
-    case (r ?& "version") of
-        (Just version) -> do
-            dists' <- readMVar dists
-            if version `elem` dists'  -- Validate version exists
-            then return $ Server.download (dists_dir & "/" & version & ".tar.gz") Nothing
-            else fail $ "Invalid version " & version
-        otherwise -> do
-            fail "Invalid arguments"
-```
-
-**Functionality:**
-- Downloads specific distribution version
-- Uses `withQSem` to limit concurrent downloads
-- Validates version existence before serving file
-- Returns the actual `.tar.gz` file for download
-
-### 3. `/ping` - Service Health Check
-```haskell
-"ping" $/ GET $. \_ -> do
-    v <- io Core.versionLong
-    return $ responseObject
-           $ toAny
-           $ fromMaybe (if "head"`Str.isPrefixOf`v
-                        then Version.Version tod (" ("&v&")") ""  -- Development version
-                        else Version.Version (Date.date 1900 01 01)  -- Fallback version
-                                                 "s000000" "(unreal)")
-                       (Version.parseVersion v)
-```
-
-**Functionality:**
-- Returns version information for health checking
-- Handles both release and development versions
-- Provides fallback version if parsing fails
-
-### 4. `/exit` - Server Shutdown
-```haskell
-"exit" $/ GET $. \r -> do
-    Core.exit 0  -- Terminate the server
-    return $ responseText "OK"
-```
-
-## Key Features
-
-### 1. Distribution Management
-- **Automatic Discovery**: Scans directory for `.tar.gz` files periodically
-- **Version Tracking**: Maintains list of available distributions in shared state
-- **File Serving**: Efficiently serves distribution archives
-
-### 2. Concurrency Control
-- **Rate Limiting**: Uses `QSem` to limit concurrent downloads (default: 30)
-- **Thread Safety**: Uses `MVar` for safe concurrent access to distribution list
-
-### 3. Background Maintenance
-- **Periodic Scanning**: Background thread checks for new distributions every 20 seconds
-- **Dynamic Updates**: Automatically detects new distribution files
-
-### 4. Error Handling
-- **Version Validation**: Checks if requested version exists before serving
-- **Directory Existence**: Verifies distribution directory exists
-- **Graceful Fallbacks**: Handles missing directories and parsing errors
-
-### 5. API Flexibility
-- **Multiple Formats**: Supports both JSON and native response formats
-- **Version Parsing**: Handles different version string formats
-- **Health Monitoring**: Provides ping endpoint for service monitoring
-
-## File Naming Convention
-
-The system expects distribution files to follow the pattern:
-```
-{version_name}.tar.gz
-```
-
-For example:
-- `cortex-2.1.0.tar.gz`
-- `production-release.tar.gz`
-- `development-snapshot.tar.gz`
-
-## Usage Example
-
-1. **List available versions**:
-   ```bash
-   curl http://localhost:31998/available
-   ```
-
-2. **Download specific version**:
-   ```bash
-   curl http://localhost:31998/dist?version=cortex-2.1.0 -o cortex-2.1.0.tar.gz
-   ```
-
-3. **Check service health**:
-   ```bash
-   curl http://localhost:31998/ping
-   ```
-
-This DistManager is a crucial component for managing runtime environments in the Aquila distributed computing system, ensuring that compute nodes can access the required Cortex distributions efficiently and reliably.
+        "exit" $/ GET $. \r -> do
+            Core.exit 0
+            return $ responseText "OK"
