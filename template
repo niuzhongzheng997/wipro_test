@@ -1,170 +1,132 @@
-This is an asynchronous risk calculation broker server implementation. Let me analyze this code in detail:
+{-# LANGUAGE RecordWildCards #-}
+-- Author: 1297892
+-- Created on: 3/29/2016 6:32:35 PM
+module Cortex.Concurrent.Aquila.Trail
+    ( Server.Config(..)
+    , Server.Verbosity(..)
+    , Settings(..)
+    , Options(..)
+    , start
+    , startServer
+    , main
+    ) where
 
-## Overall Architecture
+import Cortex.Data.HTTP.Server as Server
+import Cortex.Data.HTTP.Persistent as HTTP
+import Cortex.Concurrent.Aquila.Trail.Context
+import Cortex.Concurrent.Aquila.Trail.Database as Database
+import Cortex.Concurrent.Aquila.Trail.System as Sys
+import Cortex.Concurrent.Aquila.Utils as Utils
+import qualified Cortex.Data.DB.Connect as Connect
+import qualified Cortex.Stem.Stream as Stream
+import Cortex.Stem.Thread.Mu(sleep)
+import System.Console.CmdArgs.Explicit
+import System.Console.CmdArgs.Text
+import Control.Arrow
+import Control.Monad
+import Data.Default
 
-This is a distributed risk calculation system that serves as a proxy layer for the Aquila computation grid, responsible for:
-- Receiving risk calculation requests
-- Managing job submissions to the Aquila computation grid
-- Tracking in-progress job status
-- Collecting calculation results and returning them to clients
+data Settings = Settings
+    { createDatabase :: Bool
+    , sysSettings    :: Sys.SystemSettings
+    } deriving (Show)
 
-## Core Data Structures
+instance Default Settings where
+    def = Settings def def
 
-### 1. Options - Server Configuration
-```haskell
+flags :: (String, String, [Flag Settings])
+flags = (,,) "Settings" "Aquila Trail Settings"
+    [ flagNone ["create-database"] (\x -> x{createDatabase=True}) "create the database before starting"
+    , flagReq ["dist-manager"] (\s x -> Right(x{sysSettings=def{Sys.distManager=Just (Utils.hostPortPair s)}}))
+        "HOST:PORT" "Aquila dist manager host:port"
+    ]
+
 data Options = Options
-    { maxSubmissions :: Int          -- Maximum concurrent submissions
-    , aquilaJobMan :: Maybe (String, Int)    -- Aquila job manager address
-    , onPremJobMan :: Maybe (String, Int)    -- Local job manager (small jobs)
-    , onPremTrail :: Maybe (String, Int)     -- Local Trail server
-    , smallLimit :: Int              -- Small job threshold
-    , multiAquilaDBName :: Maybe String      -- Multi-Aquila database name
-    , multithreadedAquilaInstanceNames :: [String]  -- Multithreaded instance names
-    , expiryLimit :: Int             -- Job expiration time (seconds)
-    , entitlementCheck :: Maybe String       -- Entitlement check
-    }
-```
+    { serverOptions         :: Server.Config
+    , connectOptions        :: Connect.Options
+    , settings              :: Settings
+    } deriving (Show)
 
-### 2. Context - Runtime Context
-```haskell
-data Context = Context
-  { submissionLimit :: QSem          -- Concurrency control semaphore
-  , inflightSubmissions :: InflightSubmissions  -- In-progress jobs
-  , taskCount :: TaskCount           -- Task count cache
-  , serverAlive :: IORef Bool        -- Aquila availability status
-  , acceptingConnections :: IORef Bool  -- Whether to accept new connections
-  }
-```
+instance Default Options where
+    def = Options
+        { serverOptions = def { title = __MODULE__, nThreads = 256, backlog = Just 256, maxQueued = Just 256, port = 2907, safe = False, core = POCO, keepAliveConfig = Nothing }
+        , connectOptions = def
+            { Connect.dbms = Just Connect.PostgreSQL
+            , Connect.db = Just $ "Aquila.Trail." & show schemaVersion
+            }
+        , settings = def
+        }
+        -- NOTE: nThreads: POCO uses a threadpool, nThreads is the maximum size of the pool
 
-### 3. InflightJob - In-Progress Job
-```haskell
-data InflightJob = InflightJob
-  { lastSeen :: Datetime             -- Last activity time
-  , jobCollector :: Either (Future AsyncCollector) AsyncCollector  -- Collector
-  }
-```
-
-## Main Functional Modules
-
-### 1. HTTP API Handling (`handler` function)
-```haskell
-handler :: Options -> Context -> Handler ()
-handler opts ctx = "call" $/ do
-  methodIO $ \(SubmitV0 job) -> submitJob opts ctx job      -- Submit job
-  methodIO $ \(CollectV0 hdl) -> collectResults ctx hdl     -- Collect results
-  methodIO $ \(CloseV0 hdl) -> closeInflight ctx hdl        -- Close job
-  methodIO $ \(PingV0 _) -> ping check                     -- Heartbeat check
-  methodIO $ \(PingV1 _) -> Versioned heartbeat check
-  -- Management APIs (require JWT authentication)
-  authoriseJWT (Just ["1341796"]) $ \_-> methodIO $ \(DisableConnectionV0 _) -> ...
-  authoriseJWT (Just ["1341796"]) $ \_-> methodIO $ \(ReenableConnectionV0 _) -> ...
-```
-
-### 2. Job Submission Logic (`submitJob`)
-```haskell
-submitJob :: Options -> Context -> SubmitJob -> IO InflightJobHandle
-submitJob opts Context{..} job@SubmitJob{..} = do
-  -- 1. Check grid task count
-  tc <- io $ gridTaskCount taskCount
-  
-  -- 2. Decide job routing (local or remote)
-  local <- if jobNTasks <= smallLimit opts  -- Small jobs go locally
-              && isJust (onPremJobMan opts) && isJust (onPremTrail opts)
-           then checkLocalCapacity
-           else return False
-  
-  -- 3. Check server availability
-  when (not local) $ do
-      alive <- readIORef serverAlive
-      when (not alive) $ fail "server offline"
-  
-  -- 4. Acquire concurrency permit
-  waitQSem submissionLimit
-  
-  -- 5. Submit job
-  inflight <- doSubmit opts' tc `onException` signalQSem submissionLimit
-  
-  -- 6. Track job
-  hdl <- InflightJobHandle <$> io Core.createGuid
-  addJob inflightSubmissions hdl inflight
-  return hdl
-```
-
-### 3. Result Collection Logic (`collectResults`)
-```haskell
-collectResults :: Context -> InflightJobHandle -> IO (Maybe Results)
-collectResults Context{..} hdl =
-  lookupJob inflightSubmissions hdl >>= maybe (noSuchJob hdl) collectUpdate
+getOptions :: IO Options
+getOptions = do
+    (help,rest) <- processArgs optMode
+    case help of
+        Just (a,b) -> do
+            putStrLn $ showText b $ helpText a optMode
+            error "--help specified"    -- FIXME: better to terminate quitely
+        Nothing -> injectConnection rest
   where
-  collectUpdate = flip modifyMVarNonAtomically $ maybe (noSuchJob hdl) collectUpdate'
-  
-  collectUpdate' job =
-    either (collectFut job) (collectNow job) (jobCollector job)
-  
-  collectNow job collector = do
-    ts <- io Date.now
-    (Just job { lastSeen = ts },) <$> collect collector  -- Direct result collection
-  
-  collectFut job colFuture =
-    try (io (result colFuture 5)) >>= either submitFailed (submitNotFailed job)
-```
+    injectConnection :: Options -> IO Options
+    injectConnection opts = do
+        let ss = settings opts
+            sy = sysSettings ss
+        case Sys.distManager sy of
+          Just{} -> do
+              h <- io HTTP.clientHandle
+              return opts{ settings = ss{ sysSettings = sy
+                                            { Sys.handle = Just h }}}
+          Nothing -> return opts
 
-### 4. Background Maintenance Threads
+optMode :: Mode (Maybe (HelpFormat, TextFormat), Options)
+optMode = (mode "Aquila.Trail" (def,opt) "Run Aquila Trail Server" (flagArg (\v x -> error "no direct arguments permitted") "") [])
+            {modeGroupFlags=Group [flagHelpFormat (\a b (_,x) -> (Just (a,b),x))] [] $ map (second $ map remapSecond) gs
+            ,modeHelpSuffix=[]}
+    where gs = [ f Server.configFlags serverOptions (\v x -> v{serverOptions=x})
+               , f Connect.flags connectOptions (\v x -> v{connectOptions=x})
+               , f flags settings (\v x -> v{settings=x})
+               ]
+          opt = def
 
-**Housekeeping Thread** (`runHouseKeeping`):
-```haskell
-runHouseKeeping :: Options -> Context -> IO ()
-runHouseKeeping Options{..} ctx@Context{..} =
-  void $ forkIO $ forever $ try $ do
-    threadDelay (60 * 1000 * 1000)  -- Run every minute
-    jobs <- listJobs inflightSubmissions
-    forM_ jobs $ \(hdl, job) -> tryModifyMVarNonAtomically_ job $ \case
-      Nothing -> removeJob inflightSubmissions hdl  -- Clean up closed jobs
-      Just job -> houseKeep hdl job  -- Check for expired jobs
-```
+f :: (String,String,[Flag a]) -> (Options -> a) -> (Options -> a -> Options) -> (String, [Flag Options])
+f (name,desc,fs) proj embed = (name & ": " & desc, [remap (embed def) (proj &&& embed) x | x <- fs])
 
-**Liveness Check Thread** (`runLivenessCheck`):
-```haskell
-runLivenessCheck :: Options -> Context -> IO ()
-runLivenessCheck Options{..} Context{..} =
-  void $ forkIO $ forever $ try $ do
-    threadDelay (5 * 60 * 1000 * 1000)  -- Check every 5 minutes
-    alive <- readIORef serverAlive
-    x <- maybe (return True) (io . fmap isRight . JobManager.ping) aquilaJobMan
-    case x of
-        False -> atomicModifyIORef_ serverAlive (const False)  -- Mark as offline
-        True  -> when (not alive) $ atomicModifyIORef_ serverAlive (const True)
-```
+remapSecond :: (Default b, Remap m) => m a -> m (b, a)
+remapSecond = remap (def,) (\(h,x) -> (x,(h,)))
 
-## Key Design Features
+start' :: (Config -> Handler () -> IO a) -> Connect.Options -> Server.Config -> Settings -> IO a
+start' run connectOptions serverOptions Settings{..} = do
+    ctx <- context connectOptions
+    Database.create connectOptions createDatabase
+    setLastEvent ctx =<< io (Database.lastTimeStamp =<< Connect.connect connectOptions)
+    run serverOptions $ do
+        Database.handler sysSettings ctx
 
-### 1. Concurrency Control
-- Uses `QSem` to control maximum concurrent submissions
-- Uses `MVar` to protect shared state
-- Uses `IORef` for atomic operations
+-- | Start server with options in a separate thread.
+startServer :: Connect.Options -> Server.Config -> Settings -> IO Server.Server
+startServer = start' runServer
 
-### 2. Error Recovery
-- Comprehensive exception handling (`try`, `catch`, `onException`)
-- Job timeout and expiration handling
-- Server availability monitoring and automatic recovery
+-- | Start server with options in a separate thread. Returns server stop action.
+start :: Connect.Options -> Server.Config -> Settings -> IO (Int, IO ())
+start opts cfg stgs = do
+    srv <- startServer opts cfg stgs
+    port <- boundPort srv
+    let stop = do
+            putStrLn $ unwords ["Stopping server at port", show port]
+            stopServer srv
+            waitForServer srv
+    return (port, stop)
 
-### 3. Resource Management
-- Job routing decisions (local vs remote)
-- Capacity-based load balancing
-- Task count caching and monitoring
-
-### 4. State Tracking
-- Uses `InflightSubmissions` to track all in-progress jobs
-- Regular cleanup of expired jobs
-- Maintains last activity time for timeout detection
-
-## Workflow
-
-1. **Client submits job** → `POST /call/submit`
-2. **Proxy decides routing** → Local or remote Aquila
-3. **Acquire concurrency permit** → QSem control
-4. **Submit to computation grid** → Via AsyncCollector
-5. **Client polls for results** → `POST /call/collect`
-6. **Job completion cleanup** → Automatic or manual closure
-
-This is a highly reliable and scalable distributed computation broker capable of handling large-scale risk calculation jobs while providing excellent error recovery and resource management capabilities.
+main :: IO ()
+main = do
+    Options{..} <- getOptions
+    connectOptions' <- case Connect.dbTrace connectOptions of
+        Connect.LogFile fn -> do
+            s <- Stream.fileCreate fn
+            return $ connectOptions { Connect.dbTrace = Connect.Stream s }
+        _ -> return connectOptions
+    (port, stop) <- start connectOptions' serverOptions settings
+    putStrLn $ unwords ["Started server at port", show port]
+    () <- forever $ do io (sleep 10); return ()
+    -- 'stop' is what keeps the server alive here by ensuring there is a reference pointing to it
+    stop `seq` return ()
