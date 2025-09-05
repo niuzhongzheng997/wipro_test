@@ -1,250 +1,129 @@
-This is the implementation of the Aquila Job Manager, which is a critical component of the Aquila distributed computing system. Let me analyze this code in detail:
+{-|
+This is Aquila Dist Manager.
 
-## Overall Purpose
+For more details on Aquila see "Cortex.Concurrent.Aquila"
+-}
+module Cortex.Concurrent.Aquila.DistManager
+    ( main
+    , DistManagerOptions(..), start, serverConfig, flags
+    ) where
 
-The Aquila Job Manager is responsible for:
-- Managing individual job execution on compute nodes
-- Handling task distribution to workers
-- Monitoring job progress and health
-- Communicating with the Grid Manager and Trail services
-- Managing client connections and heartbeats
+import Control.Concurrent.QSem
 
-## Core Configuration
+import Cortex.Data.HTTP.Server as Server
+import Cortex.Data.Regex as Regex
+import Cortex.Stem.Thread.Mu as Thread
+import qualified Cortex.Stem.Core as Core
 
-### AqlConfig - Job Manager Configuration
-```haskell
-data AqlConfig = AqlConfig
-    { configex    :: ConfigEx          -- HTTP server configuration
-    , debug       :: Debug             -- Debug level
-    , retryLimit  :: Int               -- Maximum task retries (default: 5)
-    , taskTimeout :: Int               -- Task timeout in seconds (default: 300)
-    , clientTimeout :: Int             -- Client timeout in seconds (default: 300)
-    , manager     :: (ManagerHost, ManagerPort)  -- Grid Manager address
-    , trail       :: Maybe (String, Int)         -- Optional Trail service
-    }
-```
+import System.Directory as Dir
+import System.Console.CmdArgs.Explicit
 
-### Default Configuration
-```haskell
-instance Default AqlConfig where
-    def = AqlConfig serverConfigEx
-                    DebugNormal 5 (5 * 60) (5 * 60)  -- 5 retries, 5min timeouts
-                    (ManagerHost "127.0.0.1", ManagerPort 31999)  -- Default Grid Manager
-                    Nothing  -- No Trail by default
-```
+import Control.Monad
+import Control.Concurrent
+import Control.Concurrent.MVar
+import Data.Default
+import qualified Cortex.Data.Version as Version
+import qualified Cortex.Data.String.Mu as Str
+import qualified Cortex.Temporal.Date as Date
 
-## Server Configuration
-```haskell
-serverConfigEx :: ConfigEx
-serverConfigEx = def
-    { maxChildren = 950                -- Maximum child processes
-    , childThreads = 1024              -- Threads per child
-    , config = def
-        { safe = False
-        , nThreads = 1024              -- POCO thread pool size
-        , maxQueued = Just 1024        -- Maximum queued requests
-        , port = 32000                 -- Default port
-        , reuseAddr = False
-        , title = __MODULE__
-        , core = POCO
-        , keepAliveConfig = Just Config.KeepAlive
-            { keepAliveTimeout = 1 * 60  -- 1 minute keep-alive
-            , keepAliveRequests = 0      -- Unlimited requests per connection
-            }
+import Cortex.Data.JSON.Mu
+
+data DistManagerOptions = DistManagerOptions
+    { distManager_cortexDists :: String
+    , maxConcurrentDownloads :: Int
+    } deriving (Show)
+
+
+instance Default DistManagerOptions where
+    def = DistManagerOptions
+        { distManager_cortexDists = "./"
+        , maxConcurrentDownloads = 30
         }
+
+serverConfig :: Server.Config
+serverConfig = def
+    { title = __MODULE__
+    , nThreads = 1024
+    , backlog = Just 1024
+    , maxQueued = Just 1024
+    , port = 31998
+    , reuseAddr = False
+    , safe = False
+    , core = POCO
+    , keepAliveConfig = Nothing
     }
-```
 
-## Key Initialization
+flags :: [Flag DistManagerOptions]
+flags =
+    [ flagReq ["dists"]
+        (\s x -> Right (x {distManager_cortexDists=s}))
+        "PATH" "Path to Cortex distribution archives"
+    , flagReq ["max-downloads"]
+        (\s x -> Right (x {maxConcurrentDownloads= read s}))
+        "INT" "Max concurrent downloads"
+    ]
 
-### Job Handler Initialization
-```haskell
-jobHandler :: AqlConfig -> SessionToken -> String -> Int -> IO (Handler ())
-jobHandler myCfg@AqlConfig{..} token user myPort = do
-    -- Get local IP address
-    myAddr <- io Core.getIPAddress
-    
-    -- Create job tracker for managing job state
-    jobTracker <- newJobTracker (JobHost myAddr) (JobPort myPort)
-    
-    -- Connect to Trail service if configured
-    trailConn <- io $ traverse (uncurry Trail.connect) trail
-    
-    -- Create HTTP client for Grid Manager communication
-    managerHandle <- io clientHandle
-    
-    -- Client heartbeat tracking
-    lastHeartbeat <- newIORef =<< io Date.now
-    let clientHeartbeat = writeIORef lastHeartbeat =<< io Date.now
-```
+main :: IO ()
+main = serverMain start "DistManager" serverConfig flags
 
-## Background Monitoring Threads
+start :: Server.Config -> DistManagerOptions -> IO Server
+start cfg opts = runServer cfg =<< do
 
-### 1. Client Heartbeat Monitor
-```haskell
-forkIO $ do
-    let timeout = do  -- Timeout if no job submission
-            putStrTs $ unwords ["JobManager timed out waiting for submit"]
-            Core.exit (-1)
-        
-        gotJob jobId = forever $ do  -- Monitor client heartbeat
-            now <- io Date.now
-            last <- readIORef lastHeartbeat
-            when (Date.datetimeDiff last now > limit) $ do
-                cancelJob jobId now "client heartbeat expired"
-                Core.exit (-1)
-            io $ Thread.sleep 20
-    
-    -- Wait for client to submit job with timeout
-    maybe timeout gotJob =<< tryGetJobId jobTracker (clientTimeout * 1000)
-```
+    let dists_dir = distManager_cortexDists opts
 
-### 2. Progress Reporting Thread
-```haskell
-forkIO $ forever $ do
-    let update p = tryWithMsg . jobProgress managerHandle manager
-                 =<< (fmap (updateJobProgress p) (getJob jobTracker))
-    either printErrorType' update
-        =<< runErrorT . jobTasksProgress jobTracker =<< io Date.now
-    io $ Thread.sleep 60  -- Report every 60 seconds
-```
+    dists :: MVar [String] <- newMVar []
 
-### 3. Worker Health Monitor
-```haskell
-forkIO $ forever $ do
-    myJobId <- getJobId jobTracker
-    now <- io Date.now
-    let update TaskListHealth{..}
-            | null tlh_killed =  -- Handle rescheduled tasks
-                errorToTrail trailConn now Nothing myJobId tlh_rescheduled
-            | otherwise = do  -- Handle failed tasks
-                cancelJob myJobId now "tasks exceeded maximum retries"
-                jobWriteError jobTracker (TasksKilled tlh_killed)
-    either printErrorType' update
-        =<< runErrorT (jobHealth jobTracker now taskTimeout retryLimit)
-    io $ Thread.sleep 10  -- Check every 10 seconds
-```
+    -- Search for dists
+    let checkDists = do
+          dir_exists <- Dir.doesDirectoryExist dists_dir
+          dir_files <- if dir_exists
+              then Dir.getDirectoryContents dists_dir
+              else return []
+          let re = Regex.create "(.*)\\.tar\\.gz" -- FIXME "(.*)\\.tar\\.gz$"
+              matches = map (\x -> Regex.searchEx re x) dir_files
+              matches' = filter (\l -> length l == 2) matches
+          modifyMVar_ dists $ \d -> do
+              let d' = map (!!1) matches'
+              when (d /= d') $ do
+                  putStrLn $ "Available distributions: " & Str.intercalate ", " d'
+              return d'
 
-## HTTP API Endpoints
+    checkDists
 
-### 1. `/submit` - Job Submission
-```haskell
-"submit" $/ postValue $ \r js@JobSubmission{submission_metadata=JobMetadata{..},..} -> do
-    verifySessionToken token r      -- Authentication
-    clientHeartbeat                -- Update heartbeat
-    
-    started <- io Date.now
-    submitted_job <- either (printThenFail . show) return
-        =<< runErrorT (jobSubmit jobTracker started js)  -- Submit job
-    
-    msg <- jobStarted managerHandle manager submitted_job  -- Notify Grid Manager
-    
-    -- Record job to Trail service
-    whenJust trailConn $ \conn -> tryWithMsg $ do
-        Trail.startJob conn (unJobId job_id) Trail.JobInfo{...}
-    
-    return $ responseText "OK"
-```
+    forkIO $ forever $ do
+        checkDists
+        io $ Thread.sleep 20
 
-### 2. `/jdms` - Job Data Management
-```haskell
-"jdms" $/ GET $. \r -> do
-    let serve jd = do
-            myJobId <- getJobId jobTracker
-            case jd of
-                Right _ ->  -- Serve data directly
-                    putStrTs $ unwords ["jobid", unJobId myJobId, "no JDMs..."]
-                Left jdms ->  -- Forward to JDMs
-                    putStrTs $ unwords ["jobid", unJobId myJobId, "forwarding..."]
-            return . responseObject $ toAny jd
-    -- Handle JDM request
-    either (printThenFail . show) serve
-        =<< runErrorT (requestJDMs jobTracker ...)
-```
+    downloadsLimit <- newQSem $ maxConcurrentDownloads opts
 
-### 3. `/jobdata` - Direct Job Data Access
-```haskell
-"jobdata" $/ GET $. \r -> do
-    let serve jd = do
-            myJobId <- getJobId jobTracker
-            putStrTs $ unwords ["jobid", unJobId myJobId, "serving directly..."]
-            return . responseObject $ toAny jd
-    -- Serve job data immediately
-    either (printThenFail . show) serve
-        =<< runErrorT (requestJobData jobTracker (JobId <$> (r ?& "jobid")))
-```
+    tod <- io Date.today
+    return $ do
+        "available" $/ GET $. \r ->
+            case (r ?& "format") of
+                (Just format) | format == "json"
+                  -> responseJSON . encode . toJSON <$> readMVar dists
+                otherwise
+                  -> responseObject . toAny <$> readMVar dists
+        "dist" $/ GET $. \r -> withQSem downloadsLimit $
+            case (r ?& "version") of
+                (Just version) -> do
+                    dists' <- readMVar dists
+                    if version `elem` dists'
+                    then return $ Server.download (dists_dir & "/" & version & ".tar.gz") Nothing
+                    else fail $ "Invalid version " & version
+                otherwise -> do
+                    fail "Invalid arguments"
 
-### 4. `/collect` - Result Collection
-```haskell
-"collect" $/ GET $. \r -> do
-    verifySessionToken token r  -- Authentication
-    clientHeartbeat            -- Update heartbeat
-    -- Collect job results
-    either (printThenFail . show)
-           (return . responseObject . toAny)
-        =<< runErrorT (jobCollect jobTracker)
-```
+        "ping" $/ GET $. \_ -> do
+            v <- io Core.versionLong
+            return $ responseObject
+                   $ toAny
+                   $ fromMaybe (if "head"`Str.isPrefixOf`v
+                                then Version.Version tod (" ("&v&")") ""
+                                else Version.Version (Date.date 1900 01 01)
+                                                     "s000000" "(unreal)")
+                               (Version.parseVersion v)
 
-### 5. `/jmwork` - Worker Task Management
-```haskell
-"jmwork" $/ postValue $ \r request -> withJobStatus jobTracker
-    $ \myStatus -> if myStatus == ShuttingDown
-        then printThenFail "job manager is shutting down."
-        else do
-            now <- io Date.now
-            -- Handle worker requests (get task, submit result)
-            either (printThenFail . show)
-                   (return . responseObject . toAny . fst)
-                =<< runErrorT (jobWork trailConn
-                               (Just (managerHandle, manager))
-                               debug
-                               jobTracker
-                               (fmap JobId (r ?& "jobid"))
-                               now
-                               request
-                              )
-```
-
-### 6. `/kill` - Job Termination
-```haskell
-"kill" $/ GET $. \r -> do
-    myJobId <- getJobId jobTracker
-    now <- io Date.now
-    cancelJob myJobId now "explicitly killed"  -- Cancel job
-    
-    -- Exit after cleanup
-    forkIO $ do
-        io $ Thread.sleep 10
-        Core.exit 0
-    
-    return $ responseObject $ toAny ()
-```
-
-## Key Features
-
-### 1. Job Lifecycle Management
-- Complete job state tracking
-- Task distribution and result collection
-- Automatic retry and timeout handling
-
-### 2. Client Management
-- Session token authentication
-- Heartbeat monitoring with timeout
-- Graceful client connection handling
-
-### 3. Integration Points
-- Grid Manager communication for coordination
-- Trail service integration for auditing
-- Job Data Managers for distributed data handling
-
-### 4. Health Monitoring
-- Task health checks with configurable retries
-- Worker status monitoring
-- Automatic task rescheduling
-
-### 5. Error Handling
-- Comprehensive exception handling
-- Graceful job cancellation
-- Detailed logging and error reporting
-
-This Job Manager is a robust component that handles the execution of individual jobs in the Aquila distributed computing system, providing reliable task management, client communication, and integration with other system components.
+        "exit" $/ GET $. \r -> do
+            Core.exit 0
+            return $ responseText "OK"
