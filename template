@@ -1,318 +1,237 @@
-{-|
-This is Aquila Job Manager.
+This is the implementation of the Aquila Grid Manager, which is responsible for coordinating and managing job allocation and tracking in the distributed computation grid. Let me analyze this code in detail:
 
-For more details on Aquila see "Cortex.Concurrent.Aquila"
--}
-{-# LANGUAGE RecordWildCards #-}
-module Cortex.Concurrent.Aquila.JobManager
-    ( main
-    , AqlConfig(..), ConfigEx(..), flags, serverConfigEx, start
-    ) where
+## Overall Purpose
 
-import Data.Default
+The Aquila Grid Manager is the core coordination component of the distributed computing system, primarily responsible for:
+- Job allocation and scheduling
+- Job state tracking and monitoring
+- Version compatibility management
+- Integration with distributed managers and Trail services
 
-import Cortex.Data.HTTP.Persistent
-import Cortex.Data.HTTP.Server
-import Cortex.Data.HTTP.Server.Config as Config
-import Cortex.Data.HTTP.Spawn.Lite
-import Cortex.Data.HTTP.Spawn.Types
-import Cortex.Data.String.Mu(sipFormat)
-import Cortex.Stem.Par.Resource
-import qualified Cortex.Stem.ByteString as BS
-import qualified Cortex.Stem.Core as Core
-import qualified Cortex.Stem.Thread.Mu as Thread
-import qualified Cortex.Temporal.Date as Date
+## Core Data Structures
 
-import Cortex.Concurrent.Aquila.JobManager.Internal
-import Cortex.Concurrent.Aquila.JobManager.JobTracker
-import Cortex.Concurrent.Aquila.Manager
-import Cortex.Concurrent.Aquila.Types
-import Cortex.Concurrent.Aquila.Utils
-import qualified Cortex.Concurrent.Aquila.Trail.Client as Trail
-
-import Control.Concurrent
-import Control.Monad.Error
-import Data.IORef
-import Data.Traversable(traverse)
-import System.Console.CmdArgs.Explicit
-
-data AqlConfig = AqlConfig
-    { configex    :: ConfigEx
-    , debug       :: Debug
-    , retryLimit  :: Int
-    , taskTimeout :: Int
-    , clientTimeout :: Int
-    , manager     :: (ManagerHost, ManagerPort)
-    , trail       :: Maybe (String, Int)
+### ManagerOptions - Manager Configuration
+```haskell
+data ManagerOptions = ManagerOptions
+    { distManager     :: Maybe (String, Int)  -- Distributed manager address
+    , trail           :: Maybe (String, Int)  -- Trail service address
+    , debug           :: Debug                -- Debug level
     }
-    deriving (Show)
+```
 
-instance Default AqlConfig where
-    def = AqlConfig serverConfigEx
-                    DebugNormal 5 (5 * 60) (5 * 60)
-                    (ManagerHost "127.0.0.1", ManagerPort 31999)
-                    Nothing
+## Default Configuration
 
-serverConfigEx :: ConfigEx
-serverConfigEx = def
-    { maxChildren = 950
-    , childThreads = 1024
-    , config =  def
-        { safe = False
-        , nThreads = 1024 -- maximum threadpool size for POCO
-        , maxQueued = Just 1024
-        , port = 32000
-        , reuseAddr = False
-        , title = __MODULE__
-        , core = POCO
-        , keepAliveConfig = Just Config.KeepAlive
-            { keepAliveTimeout = 1 * 60 -- 1 minute
-            , keepAliveRequests = 0     -- infinity
-            }
+```haskell
+instance Default ManagerOptions where
+    def = ManagerOptions
+        { distManager = Just ("localhost", 31998)  -- Default distributed manager
+        , trail = Nothing
+        , debug = DebugNormal
         }
+
+serverConfig :: Server.Config
+serverConfig = def
+    { title = __MODULE__
+    , nThreads = 1024          -- Thread pool size
+    , maxQueued = Just 1024    -- Maximum queued requests
+    , port = 31999             -- Default port
+    , reuseAddr = False
+    , safe = False
+    , core = POCO              -- POCO networking core
+    , keepAliveConfig = Nothing
     }
+```
 
-flags :: [Flag AqlConfig]
-flags =
-    [ flagReq ["manager"]
-        (\s x -> Right ( x { manager = parseManager s }))
-        "HOST:PORT" "Aquila grid manager host:port"
-    , flagReq ["retry-limit"]  (\s x -> Right ( x { retryLimit = read s}))
-        "INT" "Maximum number of retries"
-    , flagReq ["task-timeout"] (\s x -> Right ( x { taskTimeout = read s}))
-        "INT" "Number of seconds to wait before timing out a task"
-    , flagReq ["client-timeout"] (\s x -> Right ( x { clientTimeout = read s}))
-        "INT" "Number of seconds to wait before timing out a client"
-    , flagReq ["debug"]        (\s x -> Right ( x { debug = read s}))
-        "DEBUG" "Debug level"
-    , flagReq ["trail"] (\s x -> Right ( x { trail = Just $ hostPortPair s}))
-        "HOST:PORT" "Aquila Trail host:port"
-    ]
+## Key Component Initialization
 
-main :: IO ()
-main = do
-    let conf = def :: AqlConfig
-    liteServerMain __MODULE__ (configex conf) jobHandler flags
+### 1. Version Management
+```haskell
+versions <- newMVar . pure . CortexVersion =<< io Core.version
+```
+Maintains a list of supported Cortex versions for version compatibility checking.
 
-start :: ConfigEx -> AqlConfig -> IO Server
-start cfgEx aqlConfig = liteServer __MODULE__ cfgEx jobHandler aqlConfig
+### 2. Distributed Manager Connection
+```haskell
+distMan <- io clientHandle
+```
+Creates an HTTP client for communicating with the distributed manager.
 
-errorToTrail trail taskFailed msg jobId taskIds = whenJust trail $ \trail -> do
-    let (taskError, taskReschedule)
-            = maybe ("task rescheduled", True) (, False) msg
-        finish tid = (unJobId jobId, unTaskId tid, Trail.TaskFail{..})
-    unless (null taskIds) $ tryWithMsg
-        $ Trail.failTask trail $ map finish taskIds
-    whenJust msg $ const $ tryWithMsg
-        $ Trail.finishJob trail (unJobId jobId) $ Trail.JobPerf taskFailed msg
+### 3. Trail Service Connection
+```haskell
+trailConn <- io $ traverse (uncurry Trail.connect) trail
+```
+Optional Trail service connection for auditing and monitoring.
 
-printErrorType' NoJobId{} = return ()
-printErrorType' x = printErrorType x
+### 4. Job Allocator
+```haskell
+jobAllocator <- JA.newJobAllocator 5 Nothing
+```
+Creates a job allocator responsible for job scheduling and task allocation.
 
-jobHandler :: AqlConfig -> SessionToken -> String -> Int -> IO (Handler ())
-jobHandler myCfg@AqlConfig{..} token user myPort = do
-    putStrTs $ unwords [ "JobManager started on port", show myPort
-                       , "with config", show myCfg ]
+## Background Maintenance Threads
 
-    myAddr <- io Core.getIPAddress
+### Version Check Thread
+```haskell
+forkIO $ forever $ do
+    tryWithMsg checkVers      -- Check supported versions
+    tryWithMsg expireJobs     -- Clean up expired jobs
+    io $ Thread.sleep 60      -- Run every minute
+```
 
-    jobTracker <- newJobTracker (JobHost myAddr) (JobPort myPort)
+### Version Check Logic
+```haskell
+checkVers = do
+  supportedVers <- case distManager of
+      Just (addr, port) -> fmap (either (const []) id)
+          $ try $ DistManager.available distMan addr port
+      otherwise -> return []
+  modifyMVar_ versions $ \vers -> do
+      let vers' | not (null supportedVers) = sortNub supportedVers
+                | otherwise = vers
+      when (vers /= vers') $ putStrTs $ unwords
+          [ "Supported versions:"
+          , Str.intercalate ", " $ map unCortexVersion vers' ]
+      return vers'
+```
 
-    trailConn <- io $ traverse (uncurry Trail.connect) trail
+### Job Expiration Cleanup
+```haskell
+expireJobs = do
+    expired <- JA.jobExpired jobAllocator  -- Get expired jobs
+    unless (null expired) $ putStrTs $ unwords
+        [ "expired", show $ map unJobId expired ]
+    ts <- io Date.now
+    whenJust trailConn $ \trail -> forM_  expired $ \jobId -> do
+        let purge = Trail.finishJob trail (unJobId jobId)
+                  $ Trail.JobPerf ts (Just "job purged")
+        backoff False 3 1 10 purge >>= \case  -- Cleanup with retry
+            Left e -> putStrTs e
+            Right () -> return ()
+```
 
-    managerHandle <- io clientHandle
+## HTTP API Endpoints
 
-    -- Client heartbeat
-    lastHeartbeat <- newIORef =<< io Date.now
-    let clientHeartbeat = writeIORef lastHeartbeat =<< io Date.now
+### 1. `/jobStarted` - Job Start Notification
+```haskell
+"jobStarted" $/ postValue $ \r job@Job{job_metadata=JobMetadata{..},..} -> do
+    vers <- readMVar versions
+    if job_version `elem` vers  -- Version compatibility check
+    then do
+        JA.jobProgress jobAllocator job  -- Update job progress
+        when (debug >= DebugNormal) $ putStrTs $ unwords
+            [ "started", show (job_user, job_id, job_version, ...) ]
+        return $ responseObject $ toAny (Nothing :: Maybe String)
+    else
+        return $ responseObject $ toAny (Just "Version is not supported")
+```
 
-    let cancelJob jobId now msg = do
-            jobUpdateStatus jobTracker ShuttingDown
-            putStrTs $ unwords ["jobid", unJobId jobId, msg]
-            -- Inform grid manager
-            tryWithMsg $ jobFinished managerHandle manager jobId
-            -- Update tasklist and trail
-            let update = errorToTrail trailConn now (Just msg) jobId
-            either printErrorType update
-                =<< runErrorT (jobCancelTasks jobTracker jobId now)
+### 2. `/jobProgress` - Job Progress Update
+```haskell
+"jobProgress" $/ postValue $ \r job@Job{job_progress=p@JobProgress{..}, ..} -> do
+    now <- io Date.now  -- Use local time to avoid clock skew
+    JA.jobProgress jobAllocator job{job_progress=p{job_lastSeen=now}}
+    when (debug >= DebugLoud) $ putStrTs $ unwords
+        [ "jobid", unJobId (job_id job_metadata)
+        , show (job_available, job_complete, job_allocated) ]
+    return $ responseObject $ toAny ()
+```
 
-    -- check that client submits job, and watch client heartbeats
-    forkIO $ do
-        let timeout = do
-                putStrTs $ unwords
-                    [ "JobManager on port", show myPort
-                    , "timed out waiting for submit" ]
-                Core.exit (-1)
-
-            gotJob jobId = forever $ do
-                now <- io Date.now
-                last <- readIORef lastHeartbeat
-                when (Date.datetimeDiff last now > limit) $ do
-                    cancelJob jobId now "client heartbeat expired"
-                    Core.exit (-1)
-                io $ Thread.sleep 20
-
-            -- client heartbeat limit for now: 5 minutes
-            -- FIXME make this an option
-            limit = fromInt clientTimeout / 60 / 60 / 24
-
-        -- wait for client to call submit
-        -- 'gotJob' will then run a thread to watch client heartbeats
-        maybe timeout gotJob =<< tryGetJobId jobTracker (clientTimeout * 1000)
-
-    -- Provide job progress to grid manager, serve as heartbeats too
-    forkIO $ forever $ do
-        let update p = tryWithMsg . jobProgress managerHandle manager
-                     =<< (fmap (updateJobProgress p) (getJob jobTracker))
-        either printErrorType' update
-            =<< runErrorT . jobTasksProgress jobTracker =<< io Date.now
-        io $ Thread.sleep 60
-
-    -- watch workers updates
-    forkIO $ forever $ do
-        myJobId <- getJobId jobTracker
-        now <- io Date.now
-        let update TaskListHealth{..}
-                | null tlh_killed = -- tell trail about the rescheduled tasks
-                    errorToTrail trailConn now Nothing myJobId tlh_rescheduled
-                | otherwise = do -- cancel the job and send error to client
-                    cancelJob myJobId now "tasks exceeded maximum retries"
-                    jobWriteError jobTracker (TasksKilled tlh_killed)
-        either printErrorType' update
-            =<< runErrorT (jobHealth jobTracker now taskTimeout retryLimit)
-        io $ Thread.sleep 10
-
-    return $ do
-        -- Accept work from front end
-        "submit" $/ postValue $
-            \r js@JobSubmission{submission_metadata=JobMetadata{..},..} ->
-          do
-            verifySessionToken token r
-            clientHeartbeat
-
-            started <- io Date.now
-
-            submitted_job <- either (printThenFail . show) return
-                =<< runErrorT (jobSubmit jobTracker started js)
-
-            msg <- jobStarted managerHandle manager submitted_job
-            whenJust msg printThenFail
-
-            when (debug >= DebugNormal) $ putStrTs $ unwords
-                [ "submitted", show (job_id, job_session, job_version)
-                , "on port", show myPort
-                , "number of tasks", show job_ntodo
-                , "max task memory"
-                , sipFormat (job_largestTaskMem submitted_job) 0 ]
-
-
-            -- If this fails Trail won't know about the job
-            whenJust trailConn $ \conn -> tryWithMsg $ do
-                let mkTaskInfo resource = Trail.TaskInfo
-                        { taskTime = computeTime resource
-                        , taskMemory = maxMemory resource }
-                    f = fromIntegral . BS.size
-                Trail.startJob conn (unJobId job_id) Trail.JobInfo
-                    { jobName = job_session
-                    , jobUser = job_user
-                    , account = job_account
-                    , version = unCortexVersion job_version
-                    , taskCount = job_ntodo
-                    , closureSize = f $ unWrappedClosure submission_closure
-                    , tasksSize = f $ unWrappedTaskArray submission_taskArray
-                    , taskInfo = map (mkTaskInfo . snd)
-                        (job_available $ job_progress submitted_job)
-                    , jobStarted = started }
-
-            return $ responseText "OK"
-
-        -- serve job data to instance job data managers
-        "jdms" $/ GET $. \r -> do
-            let serve jd = do
-                    myJobId <- getJobId jobTracker
-                    case jd of
-                        Right _ -> when (debug >= DebugNormal)
-                            $ putStrTs $ unwords
-                            [ "jobid", unJobId myJobId
-                            , "no JDMs, serving closure and task array"
-                            , "to instance", r !& "jdmhost" ]
-                        Left jdms -> when (debug >= DebugNormal)
-                            $ putStrTs $ unwords
-                            [ "jobid", unJobId myJobId
-                            , "forwarding instance", r !& "jdmhost"
-                            , "to JDMs", show jdms ]
-                    return . responseObject $ toAny jd
-            now <- io Date.now
-            either (printThenFail . show) serve
-                =<< runErrorT (requestJDMs jobTracker
-                       ( fmap JobId (r ?& "jobid") )
-                       ( InstanceManagerId (r !& "imid") )
-                       ( JDM ( JobDataManagerHost $ r !& "jdmhost"
-                             , JobDataManagerPort . read $ r !& "jdmport" ) )
-                       now )
-
-        "jobdata" $/ GET $. \r -> do
-            let serve jd = do
-                    myJobId <- getJobId jobTracker
-                    when (debug >= DebugNormal) $ putStrTs $ unwords
-                        [ "jobid", unJobId myJobId
-                        , "serving closure and task array immediately"
-                        , "to instance", r !& "inst" ]
-                    return . responseObject $ toAny jd
-            either (printThenFail . show) serve
-                =<< runErrorT (requestJobData jobTracker
-                                              (JobId <$> (r ?& "jobid")))
-
-        -- client heartbeating and partial result collection
-        -- FIXME client to send jobid over, job manager to verify it
-        "collect" $/ GET $. \r -> do
-            verifySessionToken token r
-            clientHeartbeat
-            either (printThenFail . show)
-                   (return . responseObject . toAny)
-                =<< runErrorT (jobCollect jobTracker)
-
-{- Ping actually works when implemented in Cortex.Data.HTTP.Spawn.Lite.
--- It does not work here in this handler.
--- import qualified Cortex.Data.Version as Version
-        "ping" $/ GET $. \_ -> do
-            v <- io Core.versionLong
-            when (debug >= DebugNormal) $ putStrTs $ unwords
-                     [ "received a ping,"
-                     , "respond based on", v ]
-            return $ responseObject
-                   $ toAny
-                   $ fromMaybe (Version.Version (Date.date 1900 01 01)
-                                                "s000000" "(unreal)")
-                               (Version.parseVersion v)
--}
-
-        "jmwork" $/ postValue $ \r request -> withJobStatus jobTracker
-            $ \myStatus -> if myStatus == ShuttingDown
-                then
-                    printThenFail "job manager is shutting down."
-                else do
-                    now <- io Date.now
-                    either (printThenFail . show)
-                           (return . responseObject . toAny . fst)
-                        =<< runErrorT (jobWork trailConn
-                                               (Just (managerHandle, manager))
-                                               debug
-                                               jobTracker
-                                               (fmap JobId (r ?& "jobid"))
-                                               now
-                                               request
-                                      )
-
-        -- Kill
-        "kill" $/ GET $. \r -> do
-            myJobId <- getJobId jobTracker
-            now <- io Date.now
-            cancelJob myJobId now "explicitly killed"
-
-            --  exit
-            forkIO $ do
-                io $ Thread.sleep 10
-                Core.exit 0
-
+### 3. `/jobFinished` - Job Completion Notification
+```haskell
+"jobFinished" $/ GET $. \r ->
+    case r ?& "jobid" of
+        Just jid -> do
+            JA.jobFinish jobAllocator (JobId jid)  -- Mark job as completed
+            when (debug >= DebugNormal) $
+                putStrTs $ unwords [ "finished", jid ]
             return $ responseObject $ toAny ()
+        _ -> printThenFail "jobFinished: missing jobid parameter"
+```
+
+### 4. `/jobAlloc` - Task Allocation Request
+```haskell
+"jobAlloc" $/ postValue $ \r allocRequest -> do
+    now <- io Date.now
+    allocated <- JA.jobAllocations jobAllocator now allocRequest  -- Allocate tasks
+    
+    -- Debug logging
+    when (DebugNormal <= debug && debug < DebugLoud && not (null allocated))
+        $ putStrTs $ unwords [ "requested", show (freeWorkers allocRequest)
+                            , "allocated", show (length allocated), "tasks" ]
+    
+    return $ responseObject $ toAny allocated
+```
+
+### 5. `/jobs` - Job List Query
+```haskell
+"jobs" $/ GET $. \r -> do
+    info <- sortBy (comparing $ job_session . job_metadata)
+             <$> JA.jobInfo jobAllocator  -- Get job information
+    return $ responseText $ unlines $
+        ["Jobs : allocated - complete / available"
+        ,"---------------------------------------"
+        ] ++
+        (map (\Job{..} -> unwords  -- Format job information
+                [ job_user, job_session, unJobId job_id, ... ])
+             info)
+```
+
+## Client API Functions
+
+### Job Start Notification
+```haskell
+jobStarted :: HTTPClient -> (ManagerHost, ManagerPort) -> Job -> IO (Maybe String)
+jobStarted handle (host, port) job = post handle url job [] opts
+    where url = "http://" ++ unManagerHost host ++ ":" ++ show port ++ "/jobStarted"
+```
+
+### Job Progress Update
+```haskell
+jobProgress :: HTTPClient -> (ManagerHost, ManagerPort) -> Job -> IO ()
+jobProgress handle (host, port) job = post handle url job [] opts
+```
+
+### Job Completion Notification
+```haskell
+jobFinished :: HTTPClient -> (ManagerHost, ManagerPort) -> JobId -> IO ()
+jobFinished handle (host, port) jobId = get handle url [] opts
+    where url = "http://" ++ unManagerHost host ++ ":" ++ show port 
+                ++ "/jobFinished?jobid=" ++ unJobId jobId
+```
+
+### Task Allocation Request
+```haskell
+jobAlloc :: HTTPClient -> (ManagerHost, ManagerPort) -> AllocationRequest 
+         -> IO [(Int, AllocatedJob)]
+jobAlloc handle (host, port) alloc = post handle url alloc [] opts
+    where url = "http://" ++ unManagerHost host ++ ":" ++ show port ++ "/jobAlloc"
+```
+
+## Key Features
+
+### 1. Version Management
+- Dynamically fetches supported Cortex versions
+- Rejects incompatible version jobs
+- Periodically updates version lists
+
+### 2. Job Lifecycle Management
+- Tracks job start, progress, and completion states
+- Automatically cleans up expired jobs
+- Maintains job metadata and statistics
+
+### 3. Task Allocation
+- Allocates tasks based on requested worker count
+- Considers job priority and resource requirements
+- Returns detailed allocated task information
+
+### 4. Monitoring and Auditing
+- Detailed debug logging
+- Optional Trail service integration
+- Real-time job status queries
+
+### 5. Error Recovery
+- Cleanup operations with retry
+- Exception handling and logging
+- Version compatibility checking
+
+This Grid Manager is the core coordination component of the Aquila distributed computing system, responsible for job scheduling, resource allocation, and state monitoring across the entire system.
