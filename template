@@ -1,48 +1,30 @@
-{-|
-This is Aquila Grid Manager.
+This is the implementation of the Aquila Grid Manager, which is responsible for coordinating and managing job allocation and tracking in the distributed computation grid. Let me analyze this code in detail:
 
-For more details on Aquila see "Cortex.Concurrent.Aquila"
--}
-{-# LANGUAGE LambdaCase, RecordWildCards #-}
-module Cortex.Concurrent.Aquila.Manager
-    ( main
-    , jobStarted, jobProgress, jobFinished, jobAlloc
-    , ManagerOptions(..), start, serverConfig, flags
-    ) where
+## Overall Purpose
 
-import Control.Concurrent
-import Control.Concurrent.MVar
-import Control.Exception
-import Control.Monad
-import Data.Default
-import Data.List(sortBy, sortNub)
-import Data.Ord(comparing)
-import Data.Traversable(traverse)
-import System.Console.CmdArgs.Explicit
+The Aquila Grid Manager is the core coordination component of the distributed computing system, primarily responsible for:
+- Job allocation and scheduling
+- Job state tracking and monitoring
+- Version compatibility management
+- Integration with distributed managers and Trail services
 
-import Cortex.Concurrent.Aquila.Manager.JobAllocation as JA
-import Cortex.Concurrent.Aquila.Types
-import Cortex.Concurrent.Aquila.Utils
-import Cortex.Data.HTTP.Persistent
-import Cortex.Data.HTTP.Server as Server
-import Cortex.Data.String.Mu(sipFormat)
-import qualified Cortex.Data.String.Mu as Str
-import qualified Cortex.Stem.Core as Core
-import qualified Cortex.Stem.Thread.Mu as Thread
-import qualified Cortex.Temporal.Date as Date
-import qualified Cortex.Concurrent.Aquila.DistManager.Client as DistManager
-import qualified Cortex.Concurrent.Aquila.Trail.Client as Trail
+## Core Data Structures
 
--- Manager options
+### ManagerOptions - Manager Configuration
+```haskell
 data ManagerOptions = ManagerOptions
-    { distManager     :: Maybe (String, Int)
-    , trail           :: Maybe (String, Int)
-    , debug           :: Debug
-    } deriving (Show)
+    { distManager     :: Maybe (String, Int)  -- Distributed manager address
+    , trail           :: Maybe (String, Int)  -- Trail service address
+    , debug           :: Debug                -- Debug level
+    }
+```
 
+## Default Configuration
+
+```haskell
 instance Default ManagerOptions where
     def = ManagerOptions
-        { distManager = Just ("localhost", 31998)
+        { distManager = Just ("localhost", 31998)  -- Default distributed manager
         , trail = Nothing
         , debug = DebugNormal
         }
@@ -50,194 +32,206 @@ instance Default ManagerOptions where
 serverConfig :: Server.Config
 serverConfig = def
     { title = __MODULE__
-    , nThreads = 1024
-    , maxQueued = Just 1024
-    , port = 31999
+    , nThreads = 1024          -- Thread pool size
+    , maxQueued = Just 1024    -- Maximum queued requests
+    , port = 31999             -- Default port
     , reuseAddr = False
     , safe = False
-    , core = POCO
+    , core = POCO              -- POCO networking core
     , keepAliveConfig = Nothing
     }
+```
 
-flags :: [Flag ManagerOptions]
-flags =
-    [ flagReq ["dist-manager"] (\s x -> Right(x{distManager=Just(hostPortPair s)}))
-        "HOST:PORT" "Aquila dist manager host:port"
-    , flagReq ["trail"] (\s x -> Right ( x { trail = Just $ hostPortPair s}))
-        "HOST:PORT" "Aquila Trail host:port"
-    , flagReq ["debug"]             (\s x -> Right (x { debug = read s } ))
-        "DEBUG" "Debug level"
-    ]
+## Key Component Initialization
 
-main :: IO ()
-main = serverMain start "Aquila Manager" serverConfig flags
+### 1. Version Management
+```haskell
+versions <- newMVar . pure . CortexVersion =<< io Core.version
+```
+Maintains a list of supported Cortex versions for version compatibility checking.
 
-start :: Server.Config -> ManagerOptions -> IO Server
-start cfg ManagerOptions{..} = runServer cfg =<< do
+### 2. Distributed Manager Connection
+```haskell
+distMan <- io clientHandle
+```
+Creates an HTTP client for communicating with the distributed manager.
 
-    -- Contact the Dist server if specified
-    versions <- newMVar . pure . CortexVersion =<< io Core.version
+### 3. Trail Service Connection
+```haskell
+trailConn <- io $ traverse (uncurry Trail.connect) trail
+```
+Optional Trail service connection for auditing and monitoring.
 
-    distMan <- io clientHandle
+### 4. Job Allocator
+```haskell
+jobAllocator <- JA.newJobAllocator 5 Nothing
+```
+Creates a job allocator responsible for job scheduling and task allocation.
 
-    let checkVers = do
-          supportedVers <- case distManager of
-              Just (addr, port) -> fmap (either (const []) id)
-                  $ try $ DistManager.available distMan addr port
-              otherwise -> return []
-          modifyMVar_ versions $ \vers -> do
-              let vers' | not (null supportedVers) = sortNub supportedVers
-                        | otherwise = vers
-              when (vers /= vers') $ putStrTs $ unwords
-                  [ "Supported versions:"
-                  , Str.intercalate ", " $ map unCortexVersion vers' ]
-              return vers'
+## Background Maintenance Threads
 
-    checkVers
+### Version Check Thread
+```haskell
+forkIO $ forever $ do
+    tryWithMsg checkVers      -- Check supported versions
+    tryWithMsg expireJobs     -- Clean up expired jobs
+    io $ Thread.sleep 60      -- Run every minute
+```
 
-    trailConn <- io $ traverse (uncurry Trail.connect) trail
+### Version Check Logic
+```haskell
+checkVers = do
+  supportedVers <- case distManager of
+      Just (addr, port) -> fmap (either (const []) id)
+          $ try $ DistManager.available distMan addr port
+      otherwise -> return []
+  modifyMVar_ versions $ \vers -> do
+      let vers' | not (null supportedVers) = sortNub supportedVers
+                | otherwise = vers
+      when (vers /= vers') $ putStrTs $ unwords
+          [ "Supported versions:"
+          , Str.intercalate ", " $ map unCortexVersion vers' ]
+      return vers'
+```
 
-    -- Needs to be a list so that we can round-robin across calls to get jobs
-    jobAllocator <- JA.newJobAllocator 5 Nothing
+### Job Expiration Cleanup
+```haskell
+expireJobs = do
+    expired <- JA.jobExpired jobAllocator  -- Get expired jobs
+    unless (null expired) $ putStrTs $ unwords
+        [ "expired", show $ map unJobId expired ]
+    ts <- io Date.now
+    whenJust trailConn $ \trail -> forM_  expired $ \jobId -> do
+        let purge = Trail.finishJob trail (unJobId jobId)
+                  $ Trail.JobPerf ts (Just "job purged")
+        backoff False 3 1 10 purge >>= \case  -- Cleanup with retry
+            Left e -> putStrTs e
+            Right () -> return ()
+```
 
-    let expireJobs = do
-            expired <- JA.jobExpired jobAllocator
-            unless (null expired) $ putStrTs $ unwords
-                [ "expired", show $ map unJobId expired ]
-            ts <- io Date.now
-            whenJust trailConn $ \trail -> forM_  expired $ \jobId -> do
-                let purge = Trail.finishJob trail (unJobId jobId)
-                          $ Trail.JobPerf ts (Just "job purged")
-                backoff False 3 1 10 purge >>= \case
-                    Left e -> putStrTs e
-                    Right () -> return ()
+## HTTP API Endpoints
 
-    -- Keep supported versions up to date
-    forkIO $ forever $ do
-        tryWithMsg checkVers
-        tryWithMsg expireJobs
-        io $ Thread.sleep 60
+### 1. `/jobStarted` - Job Start Notification
+```haskell
+"jobStarted" $/ postValue $ \r job@Job{job_metadata=JobMetadata{..},..} -> do
+    vers <- readMVar versions
+    if job_version `elem` vers  -- Version compatibility check
+    then do
+        JA.jobProgress jobAllocator job  -- Update job progress
+        when (debug >= DebugNormal) $ putStrTs $ unwords
+            [ "started", show (job_user, job_id, job_version, ...) ]
+        return $ responseObject $ toAny (Nothing :: Maybe String)
+    else
+        return $ responseObject $ toAny (Just "Version is not supported")
+```
 
-    return $ do
+### 2. `/jobProgress` - Job Progress Update
+```haskell
+"jobProgress" $/ postValue $ \r job@Job{job_progress=p@JobProgress{..}, ..} -> do
+    now <- io Date.now  -- Use local time to avoid clock skew
+    JA.jobProgress jobAllocator job{job_progress=p{job_lastSeen=now}}
+    when (debug >= DebugLoud) $ putStrTs $ unwords
+        [ "jobid", unJobId (job_id job_metadata)
+        , show (job_available, job_complete, job_allocated) ]
+    return $ responseObject $ toAny ()
+```
 
-        "jobStarted" $/ postValue
-                     $ \r job@Job{job_metadata=JobMetadata{..},..} ->
-          do
-            vers <- readMVar versions
-            if job_version `elem` vers
-            then do
-                JA.jobProgress jobAllocator job
-                when (debug >= DebugNormal) $ putStrTs $ unwords
-                    [ "started"
-                    , show ( job_user, job_id, job_version
-                           , job_addr, job_port
-                           , job_session, job_ntodo
-                           , sipFormat job_largestTaskMem 0) ]
-                return $ responseObject
-                       $ toAny (Nothing :: Maybe String)
-            else
-                return $ responseObject
-                       $ toAny (Just $ unwords [ "Version"
-                                               , unCortexVersion job_version
-                                               , "is not supported" ])
-
-        "jobProgress" $/ postValue
-          $ \r job@Job{job_progress=p@JobProgress{..}, ..} -> do
-            now <- io Date.now -- use local time to avoid clock skew
-            JA.jobProgress jobAllocator job{job_progress=p{job_lastSeen=now}}
-            when (debug >= DebugLoud) $ putStrTs $ unwords
-                [ "jobid", unJobId (job_id job_metadata)
-                , show (job_available, job_complete, job_allocated) ]
+### 3. `/jobFinished` - Job Completion Notification
+```haskell
+"jobFinished" $/ GET $. \r ->
+    case r ?& "jobid" of
+        Just jid -> do
+            JA.jobFinish jobAllocator (JobId jid)  -- Mark job as completed
+            when (debug >= DebugNormal) $
+                putStrTs $ unwords [ "finished", jid ]
             return $ responseObject $ toAny ()
+        _ -> printThenFail "jobFinished: missing jobid parameter"
+```
 
-        "jobFinished" $/ GET $. \r ->
-            case r ?& "jobid" of
-                Just jid -> do
-                    JA.jobFinish jobAllocator (JobId jid)
-                    when (debug >= DebugNormal) $
-                        putStrTs $ unwords [ "finished", jid ]
-                    return $ responseObject $ toAny ()
-                _ -> printThenFail "jobFinished: missing jobid parameter"
+### 4. `/jobAlloc` - Task Allocation Request
+```haskell
+"jobAlloc" $/ postValue $ \r allocRequest -> do
+    now <- io Date.now
+    allocated <- JA.jobAllocations jobAllocator now allocRequest  -- Allocate tasks
+    
+    -- Debug logging
+    when (DebugNormal <= debug && debug < DebugLoud && not (null allocated))
+        $ putStrTs $ unwords [ "requested", show (freeWorkers allocRequest)
+                            , "allocated", show (length allocated), "tasks" ]
+    
+    return $ responseObject $ toAny allocated
+```
 
-        "jobAlloc" $/ postValue $ \r allocRequest -> do
-            -- putStrTs $ "jobAlloc" & show allocRequest
-            now <- io Date.now
-            allocated <- JA.jobAllocations jobAllocator now allocRequest
+### 5. `/jobs` - Job List Query
+```haskell
+"jobs" $/ GET $. \r -> do
+    info <- sortBy (comparing $ job_session . job_metadata)
+             <$> JA.jobInfo jobAllocator  -- Get job information
+    return $ responseText $ unlines $
+        ["Jobs : allocated - complete / available"
+        ,"---------------------------------------"
+        ] ++
+        (map (\Job{..} -> unwords  -- Format job information
+                [ job_user, job_session, unJobId job_id, ... ])
+             info)
+```
 
-            when (DebugNormal <= debug && debug < DebugLoud
-                && not (null allocated))
-                $ putStrTs $ unwords
-                    [ "requested", show (freeWorkers allocRequest)
-                    , "allocated", show (length allocated), "tasks"
-                    , show $ map (\(_, AllocatedJob{..}) ->
-                                    ( aj_jobId
-                                    , aj_jobVersion
-                                    , aj_jobPort
-                                    , sipFormat (aj_jobMaxTaskMem) 0))
-                                 (sortNub allocated) ]
-            when (debug >= DebugLoud)
-                $ putStrTs $ unwords
-                    [ "requested", show allocRequest
-                    , "allocated", show (length allocated), "tasks"
-                    , show $ sortNub allocated ]
+## Client API Functions
 
-            return $ responseObject $ toAny allocated
-
---
--- Job Info
---
-        "jobs" $/ GET $. \r -> do
-            -- FIXME: The list is volatile, sort it first
-            info <- sortBy (comparing $ job_session . job_metadata)
-                 <$> JA.jobInfo jobAllocator
-            return $ responseText $ unlines $
-                ["Jobs : allocated - complete / available"
-                ,"---------------------------------------"
-                ] ++
-                (map (\Job { job_progress=JobProgress{..}
-                           , job_metadata=JobMetadata{..}
-                           , ..} -> unwords
-                        [ job_user, job_session, unJobId job_id
-                        , unCortexVersion job_version
-                        , unJobHost job_addr & ":" & show job_port
-                        , ":"
-                        , show job_allocated, "-", show job_complete
-                        , "/", show job_available
-                        ])
-                     info)
-
-        "exit" $/ GET $. \r -> do
-            Core.exit 0
-            return $ responseText "OK"
-
-----------------------------------------------------------------
-
--- Manager client API
-
-opts = noproxy
-    |+| TimeOut (5 * 60)
-    |+| KeepAlive False
-
+### Job Start Notification
+```haskell
 jobStarted :: HTTPClient -> (ManagerHost, ManagerPort) -> Job -> IO (Maybe String)
 jobStarted handle (host, port) job = post handle url job [] opts
-    where url = mconcat [ "http://", unManagerHost host, ":", show port
-                        , "/jobStarted" ]
+    where url = "http://" ++ unManagerHost host ++ ":" ++ show port ++ "/jobStarted"
+```
 
+### Job Progress Update
+```haskell
 jobProgress :: HTTPClient -> (ManagerHost, ManagerPort) -> Job -> IO ()
 jobProgress handle (host, port) job = post handle url job [] opts
-    where url = mconcat [ "http://", unManagerHost host, ":", show port
-                        , "/jobProgress"]
+```
 
+### Job Completion Notification
+```haskell
 jobFinished :: HTTPClient -> (ManagerHost, ManagerPort) -> JobId -> IO ()
 jobFinished handle (host, port) jobId = get handle url [] opts
-    where url = mconcat [ "http://", unManagerHost host, ":", show port
-                        , "/jobFinished?jobid=", unJobId jobId ]
+    where url = "http://" ++ unManagerHost host ++ ":" ++ show port 
+                ++ "/jobFinished?jobid=" ++ unJobId jobId
+```
 
-jobAlloc
-    :: HTTPClient
-    -> (ManagerHost, ManagerPort)   -- ^ server:
-    -> AllocationRequest -- ^ alloc request
-    -> IO [(Int, AllocatedJob)] -- ^ allocated jobs
+### Task Allocation Request
+```haskell
+jobAlloc :: HTTPClient -> (ManagerHost, ManagerPort) -> AllocationRequest 
+         -> IO [(Int, AllocatedJob)]
 jobAlloc handle (host, port) alloc = post handle url alloc [] opts
-    where url = mconcat [ "http://", unManagerHost host, ":", show port
-                        , "/jobAlloc" ]
+    where url = "http://" ++ unManagerHost host ++ ":" ++ show port ++ "/jobAlloc"
+```
+
+## Key Features
+
+### 1. Version Management
+- Dynamically fetches supported Cortex versions
+- Rejects incompatible version jobs
+- Periodically updates version lists
+
+### 2. Job Lifecycle Management
+- Tracks job start, progress, and completion states
+- Automatically cleans up expired jobs
+- Maintains job metadata and statistics
+
+### 3. Task Allocation
+- Allocates tasks based on requested worker count
+- Considers job priority and resource requirements
+- Returns detailed allocated task information
+
+### 4. Monitoring and Auditing
+- Detailed debug logging
+- Optional Trail service integration
+- Real-time job status queries
+
+### 5. Error Recovery
+- Cleanup operations with retry
+- Exception handling and logging
+- Version compatibility checking
+
+This Grid Manager is the core coordination component of the Aquila distributed computing system, responsible for job scheduling, resource allocation, and state monitoring across the entire system.
