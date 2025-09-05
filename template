@@ -1,318 +1,433 @@
-{-|
-This is Aquila Job Manager.
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE LambdaCase, NamedFieldPuns, RecordWildCards #-}
+{-# OPTIONS_MU --Wall #-}
+module Cortex.Risk.Broker.Async.Server(main) where
 
-For more details on Aquila see "Cortex.Concurrent.Aquila"
--}
-{-# LANGUAGE RecordWildCards #-}
-module Cortex.Concurrent.Aquila.JobManager
-    ( main
-    , AqlConfig(..), ConfigEx(..), flags, serverConfigEx, start
-    ) where
-
-import Data.Default
-
-import Cortex.Data.HTTP.Persistent
-import Cortex.Data.HTTP.Server
-import Cortex.Data.HTTP.Server.Config as Config
-import Cortex.Data.HTTP.Spawn.Lite
-import Cortex.Data.HTTP.Spawn.Types
-import Cortex.Data.String.Mu(sipFormat)
-import Cortex.Stem.Par.Resource
-import qualified Cortex.Stem.ByteString as BS
-import qualified Cortex.Stem.Core as Core
-import qualified Cortex.Stem.Thread.Mu as Thread
-import qualified Cortex.Temporal.Date as Date
-
-import Cortex.Concurrent.Aquila.JobManager.Internal
-import Cortex.Concurrent.Aquila.JobManager.JobTracker
-import Cortex.Concurrent.Aquila.Manager
-import Cortex.Concurrent.Aquila.Types
-import Cortex.Concurrent.Aquila.Utils
-import qualified Cortex.Concurrent.Aquila.Trail.Client as Trail
-
+import Control.Alternative
+import Control.Arrow
 import Control.Concurrent
-import Control.Monad.Error
+import Control.Concurrent.Cache
+import Control.Concurrent.MVar
+import Control.Concurrent.QSem
+import Control.Exception
+import Control.Monad
+import Data.Either
 import Data.IORef
-import Data.Traversable(traverse)
+import Data.Maybe
 import System.Console.CmdArgs.Explicit
 
-data AqlConfig = AqlConfig
-    { configex    :: ConfigEx
-    , debug       :: Debug
-    , retryLimit  :: Int
-    , taskTimeout :: Int
-    , clientTimeout :: Int
-    , manager     :: (ManagerHost, ManagerPort)
-    , trail       :: Maybe (String, Int)
-    }
-    deriving (Show)
+import Cortex.Concurrent.Aquila.Provision.Trail
+import Cortex.Concurrent.Aquila.Provision.Autopilot(moreRecentLimit, lessRecentLimit)
+import qualified Cortex.Concurrent.Aquila.JobManager.Client as JobManager
+import qualified Cortex.Concurrent.Aquila.Trail.Client as Trail
+import qualified Cortex.Concurrent.Aquila.Trail.Capacity as Trail
+import Cortex.Concurrent.Aquila.Utils
+import Cortex.Data.HTTP.Server
+import Cortex.Data.HTTP.Server.Config as Config
+import Cortex.Risk.Broker.Async.Protocol
+import Cortex.Risk.Broker.Async.Types
+import Cortex.Risk.Broker.MultiAquila as Multi hiding (Options)
+import Cortex.Risk.Process.StrategyType
+import Cortex.Stem.Core.BinDir(binDir)
+import Cortex.Stem.Par.Async
+import Cortex.Stem.Process.Mu
+import qualified Cortex.Data.String.URL as URL
+import qualified Cortex.Data.Version as Version
+import qualified Cortex.Stem.Core as Core
+import qualified Cortex.Stem.Dict.Mu2 as Dict
+import qualified Cortex.Stem.Relation.Typed as R
+import qualified Cortex.Stem.SafeIO as SafeIO
+import qualified Cortex.Temporal.Date.Mu as Date
+import qualified Cortex.Utils.Time as Time
+import Strat.Data.Module
 
-instance Default AqlConfig where
-    def = AqlConfig serverConfigEx
-                    DebugNormal 5 (5 * 60) (5 * 60)
-                    (ManagerHost "127.0.0.1", ManagerPort 31999)
-                    Nothing
-
-serverConfigEx :: ConfigEx
-serverConfigEx = def
-    { maxChildren = 950
-    , childThreads = 1024
-    , config =  def
-        { safe = False
-        , nThreads = 1024 -- maximum threadpool size for POCO
-        , maxQueued = Just 1024
-        , port = 32000
-        , reuseAddr = False
-        , title = __MODULE__
-        , core = POCO
-        , keepAliveConfig = Just Config.KeepAlive
-            { keepAliveTimeout = 1 * 60 -- 1 minute
-            , keepAliveRequests = 0     -- infinity
-            }
-        }
-    }
-
-flags :: [Flag AqlConfig]
+flags :: [Flag Options]
 flags =
-    [ flagReq ["manager"]
-        (\s x -> Right ( x { manager = parseManager s }))
-        "HOST:PORT" "Aquila grid manager host:port"
-    , flagReq ["retry-limit"]  (\s x -> Right ( x { retryLimit = read s}))
-        "INT" "Maximum number of retries"
-    , flagReq ["task-timeout"] (\s x -> Right ( x { taskTimeout = read s}))
-        "INT" "Number of seconds to wait before timing out a task"
-    , flagReq ["client-timeout"] (\s x -> Right ( x { clientTimeout = read s}))
-        "INT" "Number of seconds to wait before timing out a client"
-    , flagReq ["debug"]        (\s x -> Right ( x { debug = read s}))
-        "DEBUG" "Debug level"
-    , flagReq ["trail"] (\s x -> Right ( x { trail = Just $ hostPortPair s}))
-        "HOST:PORT" "Aquila Trail host:port"
-    ]
+    [ flagReq ["max-submissions"] (\s x -> Right x{maxSubmissions=read s})
+      "INT" "Maximum number of concurrent job submissions"
+    , flagReq ["aquila"] (\s x -> Right x{aquilaJobMan = Just $ f s})
+      "HOST:PORT" "Aquila job manager"
+    , flagReq ["on-prem-jm"] (\s x -> Right x{onPremJobMan = Just $ f s})
+      "HOST:PORT" "On-prem job manager (for small jobs)"
+    , flagReq ["on-prem-trail"] (\s x -> Right x{onPremTrail = Just $ f s})
+      "HOST:PORT" "On-prem trail server (for small jobs)"
+    , flagReq ["on-prem-limit"] (\s x -> Right x{smallLimit=read s})
+      "INT" "On-prem small job limit."
+    , flagReq ["multi-aquila"] (\s x -> Right x{multiAquilaDBName=Just s})
+      "STRING" "Name of the multi-Aquila database"
+    , flagReq ["multithread-aquila"]
+        (\s x -> Right x{multithreadedAquilaInstanceNames =
+                                multithreadedAquilaInstanceNames x ++ [s]})
+        "STRING" "Name of the Aquila instance to run multithreaded pricer"
+    , flagReq ["expiry-limit"] (\s x -> Right x{expiryLimit=read s})
+      "INT" "Expiry limit, in seconds."
+    , flagReq ["entitlement-check"] (\s x -> Right x{entitlementCheck=Just s})
+      "STRING" "Check for this EMS2 subject under entity AWS"
+    ] where f s = (h, p) where URL.HostPort h p = URL.readHostPort Nothing s
+
+serverConfig :: Config
+serverConfig = def
+    { title = __MODULE__
+    , nThreads = 1024
+    , Config.port = 2910
+    , reuseAddr = True
+    , safe = False
+    , core = POCO
+    , keepAliveConfig = Just KeepAlive
+                        { keepAliveTimeout = 15 * 60 -- 15 minute
+                        , keepAliveRequests = 0      -- no limit
+                        }
+    , backlog = Just 1024
+    , maxQueued = Just 1024
+    }
+
+startServer :: Config -> Options -> IO Server
+startServer cfg opts = do
+  print cfg
+  print opts
+  ctx <- mkContext opts
+  runHouseKeeping opts ctx
+  runLivenessCheck opts ctx
+  runServer cfg $ do
+    handler opts ctx
 
 main :: IO ()
-main = do
-    let conf = def :: AqlConfig
-    liteServerMain __MODULE__ (configex conf) jobHandler flags
+main = serverMain startServer __MODULE__ serverConfig flags
 
-start :: ConfigEx -> AqlConfig -> IO Server
-start cfgEx aqlConfig = liteServer __MODULE__ cfgEx jobHandler aqlConfig
+handler :: Options -> Context -> Handler ()
+handler opts ctx = "call" $/ do
+  methodIO $ \(SubmitV0 job) -> submitJob opts ctx job
+  methodIO $ \(CollectV0 hdl) -> collectResults ctx hdl
+  methodIO $ \(CloseV0 hdl) -> closeInflight ctx hdl
+  methodIO $ \(PingV0 _) ->
+             do accept <- readIORef (acceptingConnections ctx)
+                alive  <- readIORef (serverAlive ctx)
+                if accept && alive then pingVersion ctx
+                         else do putStrTs "PingV0 whilst submission disabled"
+                                 fail "Submission disabled"
+  methodIO $ \(PingV1 _) ->
+             do accept <- readIORef (acceptingConnections ctx)
+                alive  <- readIORef (serverAlive ctx)
+                if accept && alive then fmap Just (pingVersion ctx)
+                         else do putStrTs "PingV1 whilst submission disabled"
+                                 return Nothing
+  authoriseJWT (Just ["1341796"]) $ \_-> methodIO
+           $ \(DisableConnectionV0 _) ->
+                          do alive <- readIORef (acceptingConnections ctx)
+                             putStrTs "Disabling new connections"
+                             atomicModifyIORef_ (acceptingConnections ctx)
+                                                (const False)
+                             return alive
+  authoriseJWT (Just ["1341796"]) $ \_-> methodIO
+           $ \(ReenableConnectionV0 _) ->
+                          do alive <- readIORef (acceptingConnections ctx)
+                             putStrTs "Re-enabling new connections"
+                             atomicModifyIORef_ (acceptingConnections ctx)
+                                                (const True)
+                             return (not alive)
+  method   $ \(InfoManagerAddressV0 _) -> aquilaJobMan opts
 
-errorToTrail trail taskFailed msg jobId taskIds = whenJust trail $ \trail -> do
-    let (taskError, taskReschedule)
-            = maybe ("task rescheduled", True) (, False) msg
-        finish tid = (unJobId jobId, unTaskId tid, Trail.TaskFail{..})
-    unless (null taskIds) $ tryWithMsg
-        $ Trail.failTask trail $ map finish taskIds
-    whenJust msg $ const $ tryWithMsg
-        $ Trail.finishJob trail (unJobId jobId) $ Trail.JobPerf taskFailed msg
+-----------------------------------------------------------
 
-printErrorType' NoJobId{} = return ()
-printErrorType' x = printErrorType x
+data InflightJob = InflightJob
+  { lastSeen :: Datetime
+  , jobCollector :: Either (Future AsyncCollector) AsyncCollector
+  } deriving (HasType)
 
-jobHandler :: AqlConfig -> SessionToken -> String -> Int -> IO (Handler ())
-jobHandler myCfg@AqlConfig{..} token user myPort = do
-    putStrTs $ unwords [ "JobManager started on port", show myPort
-                       , "with config", show myCfg ]
+newtype InflightSubmissions = InflightSubmissions
+  (IORef (Dict String (MVar (Maybe InflightJob))))
+  -- (Maybe InflightJob) so we can explicitly mark jobs that have expired,
+  -- to prevent race between houseKeeping and other activities.
 
-    myAddr <- io Core.getIPAddress
+newInflightSubmissions :: IO InflightSubmissions
+newInflightSubmissions = InflightSubmissions <$> newIORef Dict.empty
 
-    jobTracker <- newJobTracker (JobHost myAddr) (JobPort myPort)
+addJob :: InflightSubmissions -> InflightJobHandle -> InflightJob -> IO ()
+addJob (InflightSubmissions d) hdl job = do
+  job' <- newMVar (Just job)
+  atomicModifyIORef_ d (Dict.insert (unInflightJobHandle hdl) job')
 
-    trailConn <- io $ traverse (uncurry Trail.connect) trail
+removeJob :: InflightSubmissions -> InflightJobHandle -> IO ()
+removeJob (InflightSubmissions d) hdl =
+  atomicModifyIORef_ d (Dict.delete (unInflightJobHandle hdl))
 
-    managerHandle <- io clientHandle
+lookupJob :: InflightSubmissions
+          -> InflightJobHandle
+          -> IO (Maybe (MVar (Maybe InflightJob)))
+lookupJob (InflightSubmissions d) hdl =
+  atomicModifyIORef d (id &&& Dict.lookup (unInflightJobHandle hdl))
 
-    -- Client heartbeat
-    lastHeartbeat <- newIORef =<< io Date.now
-    let clientHeartbeat = writeIORef lastHeartbeat =<< io Date.now
+listJobs :: InflightSubmissions
+         -> IO [(InflightJobHandle, MVar (Maybe InflightJob))]
+listJobs (InflightSubmissions d) =
+  atomicModifyIORef d (id &&& map (first InflightJobHandle) . Dict.toList)
 
-    let cancelJob jobId now msg = do
-            jobUpdateStatus jobTracker ShuttingDown
-            putStrTs $ unwords ["jobid", unJobId jobId, msg]
-            -- Inform grid manager
-            tryWithMsg $ jobFinished managerHandle manager jobId
-            -- Update tasklist and trail
-            let update = errorToTrail trailConn now (Just msg) jobId
-            either printErrorType update
-                =<< runErrorT (jobCancelTasks jobTracker jobId now)
+data TaskCount = TaskCount
+    { tc_activeGrids :: Cache () (R.Rel Grids)
+    , tc_pendingTasks :: Cache (String, Int) Int
+    }
 
-    -- check that client submits job, and watch client heartbeats
-    forkIO $ do
-        let timeout = do
-                putStrTs $ unwords
-                    [ "JobManager on port", show myPort
-                    , "timed out waiting for submit" ]
-                Core.exit (-1)
+newTaskCount :: Options -> SafeIO TaskCount
+newTaskCount opts = do
+    let ttl = 2 * 60 -- refresh caches after 2 munites
+    tc_activeGrids <- newCache ttl $ \() -> case multiAquilaDBName opts of
+        Just ma -> do
+            dbc <- Multi.dbConnect (Multi.dbOptions ma)
+            fmap eitherToMaybe $ SafeIO.catch $ activeGrids dbc
+        Nothing -> return $ Just R.emptyR
+    tc_pendingTasks <- newCache ttl
+        $ \(h, p) -> fmap (fmap nPendingTasks . eitherToMaybe)
+            $ SafeIO.catch
+            $ runningStats h p moreRecentLimit lessRecentLimit
+    return TaskCount{tc_activeGrids, tc_pendingTasks}
 
-            gotJob jobId = forever $ do
-                now <- io Date.now
-                last <- readIORef lastHeartbeat
-                when (Date.datetimeDiff last now > limit) $ do
-                    cancelJob jobId now "client heartbeat expired"
-                    Core.exit (-1)
-                io $ Thread.sleep 20
+gridTaskCount :: TaskCount -> SafeIO (R.Rel GridTaskCount)
+gridTaskCount TaskCount{..} = do
+    grids <- fromMaybe R.emptyR <$> askCache tc_activeGrids ()
+    R.projectT <$> R.extendM pendingTaskCount
+        (:: R.Sorting '[R.Ascend (R.NameOf CGridIPAddr)])
+        grids
+    where
+    pendingTaskCount
+        ( R.Field h :: R.FieldName (R.NameOf CGridIPAddr)
+        , R.Field p :: R.FieldName (R.NameOf CGridTrail))
+        = do
+            tc <- fromMaybe maxBound <$> askCache tc_pendingTasks (h, p)
+            return (R.Field tc :: R.FieldName (R.NameOf CGridTaskCount))
 
-            -- client heartbeat limit for now: 5 minutes
-            -- FIXME make this an option
-            limit = fromInt clientTimeout / 60 / 60 / 24
+atomicModifyIORef_ :: IORef a -> (a -> a) -> IO ()
+atomicModifyIORef_ ref f = atomicModifyIORef ref ((,()) . f)
 
-        -- wait for client to call submit
-        -- 'gotJob' will then run a thread to watch client heartbeats
-        maybe timeout gotJob =<< tryGetJobId jobTracker (clientTimeout * 1000)
+modifyMVarNonAtomically_ :: MVar a -> (a -> IO a) -> IO ()
+modifyMVarNonAtomically_ mv f = modifyMVarNonAtomically mv (fmap (,()) . f)
 
-    -- Provide job progress to grid manager, serve as heartbeats too
-    forkIO $ forever $ do
-        let update p = tryWithMsg . jobProgress managerHandle manager
-                     =<< (fmap (updateJobProgress p) (getJob jobTracker))
-        either printErrorType' update
-            =<< runErrorT . jobTasksProgress jobTracker =<< io Date.now
-        io $ Thread.sleep 60
+tryModifyMVarNonAtomically :: MVar a -> (a -> IO (a, b)) -> IO (Maybe b)
+tryModifyMVarNonAtomically mv f = tryTakeMVar mv >>= \case
+  Nothing -> return Nothing
+  Just a -> do
+    (a', b) <- f a `onException` putMVar mv a
+    putMVar mv a'
+    return (Just b)
 
-    -- watch workers updates
-    forkIO $ forever $ do
-        myJobId <- getJobId jobTracker
-        now <- io Date.now
-        let update TaskListHealth{..}
-                | null tlh_killed = -- tell trail about the rescheduled tasks
-                    errorToTrail trailConn now Nothing myJobId tlh_rescheduled
-                | otherwise = do -- cancel the job and send error to client
-                    cancelJob myJobId now "tasks exceeded maximum retries"
-                    jobWriteError jobTracker (TasksKilled tlh_killed)
-        either printErrorType' update
-            =<< runErrorT (jobHealth jobTracker now taskTimeout retryLimit)
-        io $ Thread.sleep 10
+tryModifyMVarNonAtomically_ :: MVar a -> (a -> IO a) -> IO (Maybe ())
+tryModifyMVarNonAtomically_ mv f =
+  tryModifyMVarNonAtomically mv (fmap (,()) . f)
 
-    return $ do
-        -- Accept work from front end
-        "submit" $/ postValue $
-            \r js@JobSubmission{submission_metadata=JobMetadata{..},..} ->
-          do
-            verifySessionToken token r
-            clientHeartbeat
+--withMVarNonAtomically :: MVar a -> (a -> IO b) -> IO b
+--withMVarNonAtomically mv f =
+--  modifyMVarNonAtomically mv (\a -> do b <- f a; return (a, b))
 
-            started <- io Date.now
+data Context = Context
+  { submissionLimit :: QSem
+  , inflightSubmissions :: InflightSubmissions
+  , taskCount :: TaskCount
+  , serverAlive :: IORef Bool  -- ^ Whether Aquila JobManager is unreachable.
+                               --   Detected by runLivenessCheck, also
+                               --   settable remotely with disableSubmission
+                               --   and reenableSubmission API calls.
+  , acceptingConnections :: IORef Bool -- ^ Whether to respond to pings, i.e.
+                                       --   declaring that making a connection
+                                       --   is permitted.
+  }
 
-            submitted_job <- either (printThenFail . show) return
-                =<< runErrorT (jobSubmit jobTracker started js)
+mkContext :: Options -> IO Context
+mkContext opts@Options{..} = do
+  submissionLimit <- newQSem maxSubmissions
+  inflightSubmissions <- newInflightSubmissions
+  taskCount <- io $ newTaskCount opts
+  serverAlive <- newIORef =<< maybe (return True)
+                                    (io . fmap isRight . JobManager.ping)
+                                    aquilaJobMan
+  acceptingConnections <- newIORef True
+  return Context {..}
 
-            msg <- jobStarted managerHandle manager submitted_job
-            whenJust msg printThenFail
+submitJob :: Options -> Context -> SubmitJob -> IO InflightJobHandle
+submitJob opts Context{..} job@SubmitJob{..} = do
+  tc <- io $ gridTaskCount taskCount
+  putStrTs $ "Grid pending task counts" & if R.size tc == 0 then ": 0"
+                                          else "\n"&show tc
+  local <- if jobNTasks <= smallLimit opts
+              && isJust (onPremJobMan opts) && isJust (onPremTrail opts)
+           then do
+               alive <- fmap isRight
+                        $ (io $ JobManager.ping (fromJust $ onPremJobMan opts))
+                          `catch` (\s-> return (Left s))
+               putStrTs $ "On-prem liveness (fetched): " & show alive
+               if alive then flip catch (\_-> return False) $ do
+                 onPremCapacity <- io $ currentOnPremCapacity
+                                      $ fromJust $ onPremTrail opts
+                 return (jobNTasks <= onPremCapacity)
+               else return False
+           else return False
+  when (not local) $ do
+      alive <- readIORef serverAlive
+      putStrTs $ "Server liveness (cached): " & show alive
+      when (not alive) $ do
+          printThenFail $ "submitJob rejected: server offline "
+                        & fromMaybe "unknown" (fmap show (aquilaJobMan opts)
+                                              <|> multiAquilaDBName opts)
+  let opts' = if local then opts{aquilaJobMan=onPremJobMan opts} else opts
+  waitQSem submissionLimit
+  inflight <- doSubmit opts' tc `onException` signalQSem submissionLimit
+  hdl <- InflightJobHandle <$> io Core.createGuid
+  addJob inflightSubmissions hdl inflight
+  putStrTs $ unwords [ "submitJob:", unInflightJobHandle hdl ]
+  return hdl
+  where
+  doSubmit opts tc = do
+    distOpt <- case version jobStrategy of
+        Nothing -> return []
+        Just ver -> do
+            dd <- io $ binDir ver
+            return [dist ver dd]
+    jobCollector <- fmap Left $ mkCollector distOpt
+    lastSeen <- io Date.now
+    return InflightJob {..}
+    where
+    mkCollector procOpts = computeIO procOpts $ do
+        () <- return ()
+        f <- bgImportFunctionDeferred "Cortex.Risk.Broker.Async.CheckAndSubmit.checkAndSubmit"
+        f opts tc job
 
-            when (debug >= DebugNormal) $ putStrTs $ unwords
-                [ "submitted", show (job_id, job_session, job_version)
-                , "on port", show myPort
-                , "number of tasks", show job_ntodo
-                , "max task memory"
-                , sipFormat (job_largestTaskMem submitted_job) 0 ]
+collectResults :: Context
+               -> InflightJobHandle
+               -> IO (Maybe (Dict Int (Object IByteString)))
+collectResults Context{..} hdl =
+  lookupJob inflightSubmissions hdl >>= maybe (noSuchJob hdl) collectUpdate
+  where
+  collectUpdate = flip modifyMVarNonAtomically
+    $ maybe (noSuchJob hdl) collectUpdate'
+  collectUpdate' job =
+    either (collectFut job) (collectNow job) (jobCollector job)
+  collectNow job collector = do
+    -- if collect fails broker client calls 'close' to  cleanup
+    ts <- io Date.now
+    (Just job { lastSeen = ts },) <$> collect collector
+  collectFut job colFuture =
+    try (io (result colFuture 5)) >>= either submitFailed (submitNotFailed job)
+  submitFailed err = do
+    putStrTs $ unwords [ "submission failure:", err ]
+    putStrTs $ unwords [ "submitFailed removeJob:", unInflightJobHandle hdl ]
+    removeJob inflightSubmissions hdl
+    -- QR checks/submission failed, signal the QSem
+    signalQSem submissionLimit
+    fail err
+  submitNotFailed job = maybe (colletorNotReady job) (collectorReady job)
+  colletorNotReady job = do
+    -- QR checks/submission has not finished yet, keep waiting
+    ts <- io Date.now
+    return (Just job { lastSeen = ts }, Just Dict.empty)
+  collectorReady job collector = do
+    -- QR checks/submission has finished, signal the QSem
+    signalQSem submissionLimit
+    ts <- io Date.now
+    let updated = job { lastSeen = ts
+                      , jobCollector = Right collector }
+    (Just updated,) <$> collect collector
 
+closeInflight :: Context -> InflightJobHandle -> IO ()
+closeInflight ctx@Context{..} hdl =
+  lookupJob inflightSubmissions hdl >>= maybe (noSuchJob hdl) closeIt
+  where
+  closeIt job = modifyMVarNonAtomically_ job $ maybe (noSuchJob hdl) closeJob
+  closeJob InflightJob{..} = do
+    either (closeFut ctx hdl) (closeCollector ctx hdl) jobCollector
+    return Nothing
 
-            -- If this fails Trail won't know about the job
-            whenJust trailConn $ \conn -> tryWithMsg $ do
-                let mkTaskInfo resource = Trail.TaskInfo
-                        { taskTime = computeTime resource
-                        , taskMemory = maxMemory resource }
-                    f = fromIntegral . BS.size
-                Trail.startJob conn (unJobId job_id) Trail.JobInfo
-                    { jobName = job_session
-                    , jobUser = job_user
-                    , account = job_account
-                    , version = unCortexVersion job_version
-                    , taskCount = job_ntodo
-                    , closureSize = f $ unWrappedClosure submission_closure
-                    , tasksSize = f $ unWrappedTaskArray submission_taskArray
-                    , taskInfo = map (mkTaskInfo . snd)
-                        (job_available $ job_progress submitted_job)
-                    , jobStarted = started }
+pingVersion :: Context -> IO Version.Version
+pingVersion _ctx = do
+    v <- io Core.versionLong
+    return $ fromMaybe dummy (Version.parseVersion v)
+  where
+    dummy = Version.Version
+                { versionDate     = Date.date 1900 01 01
+                , versionSuffix   = "s000000"
+                , versionCompiler = "(unreal)"
+                }
 
-            return $ responseText "OK"
+runHouseKeeping :: Options -> Context -> IO ()
+runHouseKeeping Options{..} ctx@Context{..} =
+  void $ forkIO $ forever $ try $ do
+    threadDelay (60 * 1000 * 1000)
+    jobs <- listJobs inflightSubmissions
+    putStrTs $ unwords ["Housekeeping", show (length jobs), "jobs"]
+    forM_ jobs $ \(hdl, job) -> tryModifyMVarNonAtomically_ job $ \case
+      Nothing -> do
+        removeJob inflightSubmissions hdl
+        return Nothing -- job is already closed/expired
+      Just job -> houseKeep hdl job
+    where
+    houseKeep hdl job@InflightJob{..} = do
+      ts <- io Date.now
+      if Date.diffTime ts lastSeen >= expiryLimit
+      then do
+        putStrTs $ unwords
+            [ "Expiring job", unInflightJobHandle hdl
+            , "now is", show ts
+            , "last seen", show lastSeen ]
+        either (closeFut ctx hdl) (expireCollector ctx hdl) jobCollector
+        return Nothing
+      else
+        return (Just job)
 
-        -- serve job data to instance job data managers
-        "jdms" $/ GET $. \r -> do
-            let serve jd = do
-                    myJobId <- getJobId jobTracker
-                    case jd of
-                        Right _ -> when (debug >= DebugNormal)
-                            $ putStrTs $ unwords
-                            [ "jobid", unJobId myJobId
-                            , "no JDMs, serving closure and task array"
-                            , "to instance", r !& "jdmhost" ]
-                        Left jdms -> when (debug >= DebugNormal)
-                            $ putStrTs $ unwords
-                            [ "jobid", unJobId myJobId
-                            , "forwarding instance", r !& "jdmhost"
-                            , "to JDMs", show jdms ]
-                    return . responseObject $ toAny jd
-            now <- io Date.now
-            either (printThenFail . show) serve
-                =<< runErrorT (requestJDMs jobTracker
-                       ( fmap JobId (r ?& "jobid") )
-                       ( InstanceManagerId (r !& "imid") )
-                       ( JDM ( JobDataManagerHost $ r !& "jdmhost"
-                             , JobDataManagerPort . read $ r !& "jdmport" ) )
-                       now )
+runLivenessCheck :: Options -> Context -> IO ()
+runLivenessCheck Options{..} Context{..} =
+  void $ forkIO $ forever $ try $ do
+    threadDelay (5 * 60 * 1000 * 1000)
+    alive <- readIORef serverAlive
+    x <- maybe (return True)
+               (io . fmap isRight . JobManager.ping)
+               aquilaJobMan
+    case x of
+        False -> do let failed = if alive then "failed:" else "failed again:"
+                    putStrTs $ unwords [ "Liveness check"
+                                       , failed
+                                       , show aquilaJobMan ]
+                    atomicModifyIORef_ serverAlive (const False)
+        True  -> when (not alive) $ do
+                    putStrTs $ unwords [ "Liveness check re-succeeded:"
+                                       , show aquilaJobMan ]
+                    atomicModifyIORef_ serverAlive (const True)
 
-        "jobdata" $/ GET $. \r -> do
-            let serve jd = do
-                    myJobId <- getJobId jobTracker
-                    when (debug >= DebugNormal) $ putStrTs $ unwords
-                        [ "jobid", unJobId myJobId
-                        , "serving closure and task array immediately"
-                        , "to instance", r !& "inst" ]
-                    return . responseObject $ toAny jd
-            either (printThenFail . show) serve
-                =<< runErrorT (requestJobData jobTracker
-                                              (JobId <$> (r ?& "jobid")))
+closeFut :: Context -> InflightJobHandle -> Future AsyncCollector -> IO ()
+closeFut Context{..} hdl colFut = try (abort colFut) >>= \case
+  Left e -> putStrTs $ unwords ["failed to abort submission", e]
+  Right _ -> do
+    putStrTs $ unwords [ "closeFut removeJob:", unInflightJobHandle hdl ]
+    removeJob inflightSubmissions hdl
+    signalQSem submissionLimit
 
-        -- client heartbeating and partial result collection
-        -- FIXME client to send jobid over, job manager to verify it
-        "collect" $/ GET $. \r -> do
-            verifySessionToken token r
-            clientHeartbeat
-            either (printThenFail . show)
-                   (return . responseObject . toAny)
-                =<< runErrorT (jobCollect jobTracker)
+closeCollector :: Context -> InflightJobHandle -> AsyncCollector -> IO ()
+closeCollector Context{..} hdl collector = do
+  void $ try (close collector)
+  putStrTs $ unwords ["closeCollector removeJob:", unInflightJobHandle hdl]
+  removeJob inflightSubmissions hdl
 
-{- Ping actually works when implemented in Cortex.Data.HTTP.Spawn.Lite.
--- It does not work here in this handler.
--- import qualified Cortex.Data.Version as Version
-        "ping" $/ GET $. \_ -> do
-            v <- io Core.versionLong
-            when (debug >= DebugNormal) $ putStrTs $ unwords
-                     [ "received a ping,"
-                     , "respond based on", v ]
-            return $ responseObject
-                   $ toAny
-                   $ fromMaybe (Version.Version (Date.date 1900 01 01)
-                                                "s000000" "(unreal)")
-                               (Version.parseVersion v)
--}
+expireCollector :: Context -> InflightJobHandle -> AsyncCollector -> IO ()
+expireCollector Context{..} hdl _ = do
+  -- just remove the collector from the map and let the far-end times it out
+  putStrTs $ unwords ["expireCollector removeJob:", unInflightJobHandle hdl]
+  removeJob inflightSubmissions hdl
 
-        "jmwork" $/ postValue $ \r request -> withJobStatus jobTracker
-            $ \myStatus -> if myStatus == ShuttingDown
-                then
-                    printThenFail "job manager is shutting down."
-                else do
-                    now <- io Date.now
-                    either (printThenFail . show)
-                           (return . responseObject . toAny . fst)
-                        =<< runErrorT (jobWork trailConn
-                                               (Just (managerHandle, manager))
-                                               debug
-                                               jobTracker
-                                               (fmap JobId (r ?& "jobid"))
-                                               now
-                                               request
-                                      )
+noSuchJob :: InflightJobHandle -> IO a
+noSuchJob hdl = fail $ unwords
+  [ "failed to find job handle", unInflightJobHandle hdl ]
 
-        -- Kill
-        "kill" $/ GET $. \r -> do
-            myJobId <- getJobId jobTracker
-            now <- io Date.now
-            cancelJob myJobId now "explicitly killed"
-
-            --  exit
-            forkIO $ do
-                io $ Thread.sleep 10
-                Core.exit 0
-
-            return $ responseObject $ toAny ()
+currentOnPremCapacity :: (String,Int) -> SafeIO Int
+currentOnPremCapacity (host,port) = do
+    to <- Date.now
+    let from = to Time.$- ( 10 * Time.oneSecond )
+    conn <- Trail.connect host port
+    xs <- Trail.queryLoad conn (Trail.LoadQuery Trail.TaskCount 5
+                                                Trail.UnGrouped from to)
+    is <- Trail.queryInstanceInventory conn from to
+    let maxCapacity = (\z-> if null z then 0 else snd (last z))
+                    $ Trail.capacitySeries from to
+                    $ R.extract (:: R.LabelsOf '[ Trail.CNumberOfCores
+                                                , Trail.CInstanceStarted
+                                                , Trail.CInstanceStopped ])
+                                (:: R.Sorting '[]) is
+    let maxRunning  | null xs   = 0
+                    | otherwise = let z = head [ running | (_,_,running) <- xs ]
+                                  in if null z then 0 else snd (last z)
+    return $ truncate $ maxCapacity - maxRunning
