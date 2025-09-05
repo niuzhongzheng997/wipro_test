@@ -1,220 +1,212 @@
-This is the implementation of the Aquila Job Data Manager (JDM), which is responsible for managing and serving job data to worker processes. Let me analyze this code in detail:
+{-|
+This is Aquila Worker.
 
-## Overall Purpose
+For more details on Aquila see "Cortex.Concurrent.Aquila"
+-}
+{-# LANGUAGE RecordWildCards #-}
+module Cortex.Concurrent.Aquila.Worker(
+    main
+) where
 
-The Aquila Job Data Manager serves as a dedicated data server that:
-- Manages and serves job closure data and task arrays
-- Provides efficient data access to worker processes
-- Handles job data distribution and caching
-- Integrates with Instance Manager for coordination
+import Control.Alternative((<|>))
+import Control.Concurrent
+import Control.Concurrent.MVar
+import Control.Monad
+import Control.Exception
+import Data.Default
+import Data.Maybe(isNothing)
+import System.Console.CmdArgs.Explicit
 
-## Core Configuration
+import Cortex.Concurrent.Aquila.InstanceManager.Types
+import Cortex.Concurrent.Aquila.Types
+import Cortex.Concurrent.Aquila.Utils
+import Cortex.Data.HTTP.Persistent
+import Cortex.Data.HTTP.Server
+import Cortex.Stem.Core.ProcInfo
+import qualified Cortex.Concurrent.Aquila.InstanceManager.Client as InstanceManager
+import qualified Cortex.Stem.Core as Core
+import qualified Cortex.Stem.Fun as Fun
+import qualified Cortex.Stem.Stream.Mu as Stream
+import qualified Cortex.Stem.Thread.Mu as Thread
 
-### JobDataManagerConfig - Configuration
-```haskell
-data JobDataManagerConfig = JobDataManagerConfig
-    { serverConfigEx :: ConfigEx            -- HTTP server configuration
-    , instanceManagerPort :: InstancePort   -- Parent Instance Manager port
-    , instanceManagerId   :: InstanceManagerId  -- Parent Instance Manager ID
-    , nJDMs               :: Int            -- Number of JDM processes
+data WorkerOptions = WorkerOptions
+    { worker_id           :: WorkerId
+    , worker_instancePort :: InstancePort
+    , worker_debug        :: Debug
+    , worker_jobId        :: JobId
+    , worker_jobAddr      :: JobHost
+    , worker_jobPort      :: JobPort
+    , worker_memLimit     :: Maybe Double
+    } deriving (Show)
+
+instance Default WorkerOptions where
+    def = WorkerOptions
+            { worker_id = WorkerId "no-worker"
+            , worker_instancePort = InstancePort 32200
+            , worker_debug = DebugNormal
+            , worker_jobId = JobId "none"
+            , worker_jobAddr = JobHost "127.0.0.1"
+            , worker_jobPort = JobPort 32001
+            , worker_memLimit = Nothing }
+
+serverConfig :: Config
+serverConfig = def
+    { title = __MODULE__
+    , nThreads = 8
+    , port = 32210
+    , reuseAddr = False
+    , safe = False
+    , core = POCO
     }
-```
 
-### Default Configuration
-```haskell
-instance Default JobDataManagerConfig where
-    def = defJDMConfig (JobDataManagerPort 42000) 128  -- Default port, 128 processes
+main :: IO ()
+main = serverMain start "Worker" serverConfig
+    [flagReq ["worker-id"] (\s x -> Right ( x { worker_id = WorkerId s }))
+        "STRING" "Worker id"
+    ,flagReq ["instance-port"] (\s x -> Right ( x { worker_instancePort=read s } ))
+        "PORT" "Port number of Instance manager"
+    ,flagReq ["debug"] (\s x -> Right ( x { worker_debug = read s } ))
+        "DEBUG" "Debug level"
+    ,flagReq ["job-id"] (\s x -> Right ( x { worker_jobId=JobId s } ))
+        "STRING" "Job id"
+    ,flagReq ["job-host"] (\s x -> Right ( x { worker_jobAddr=JobHost s } ))
+        "HOST" "Hostname/IP of Job manager"
+    ,flagReq ["job-port"] (\s x -> Right ( x { worker_jobPort=read s } ))
+        "PORT" "Port number of Job manager"
+    ,flagReq ["memory-limit"] (\s x -> Right (x{worker_memLimit=Just (read s)}))
+        "DOUBLE" "Worker process exits if memory usage exceeds this number when not processing tasks"
+    ]
 
-defJDMConfig :: JobDataManagerPort -> Int -> JobDataManagerConfig
-defJDMConfig jdmPort nJDMs = JobDataManagerConfig
-    { serverConfigEx = defServerConfigEx jdmPort nJDMs
-    , instanceManagerPort = InstancePort 32200  -- Default Instance Manager port
-    , instanceManagerId = InstanceManagerId ""
-    , .. }
-```
+start :: Config -> WorkerOptions -> IO Server
+start cfg opts@WorkerOptions{..} = runServer cfg =<< do
 
-## Server Configuration
-```haskell
-defServerConfigEx :: JobDataManagerPort -> Int -> ConfigEx
-defServerConfigEx jdmPort nJDMs = def
-    { maxChildren = nJDMs              -- Maximum child processes
-    , childThreads = 1024              -- Threads per child
-    , config = def
-        { safe = False
-        , nThreads = 1024              -- POCO thread pool size
-        , maxQueued = Just 1024        -- Maximum queued requests
-        , port = unJobDataManagerPort jdmPort  -- JDM port
-        , reuseAddr = False
-        , title = __MODULE__
-        , core = POCO
-        , keepAliveConfig = Just Server.KeepAlive
-            { keepAliveTimeout = 1 * 60  -- 1 minute keep-alive
-            , keepAliveRequests = 0      -- Unlimited requests
-            }
-        }
-    }
-```
+    exitSignal <- newEmptyMVar
 
-## Key Initialization
+    -- main work thread
+    forkIO $ do
+        handle <- io clientHandle
+        tryWithMsg
+            $ flip loopM (Nothing, Nothing) $ uncurry
+            $ processTask exitSignal cfg opts handle
+        -- if above throws, e.g. bad_alloc, exit
+        void $ tryPutMVar exitSignal 1
 
-### Heartbeat Mechanism
-```haskell
-heartbeat :: InstancePort -> InstanceManagerId -> IO ()
-heartbeat instancePort imid = void $ forkIO $ forever
-    $ backoff True 2 2.0 10.0 (verifyIMId instancePort imid) >>= \case
-        Left e -> do
-            putStrTs $ unwords ["JDM heartbeat failed:", e ]
-            Core.exit 0  -- Exit if parent Instance Manager is unavailable
-        Right () -> do
-            threadDelay (5 * 1000 * 1000)  -- Check every 5 seconds
-            return ()
-```
+    -- job status monitoring
+    forkIO $ do
+        handle <- io clientHandle
+        forever $ do
+            statusMonitor exitSignal cfg opts handle
+            io $ Thread.sleep 30
 
-### Server Startup
-```haskell
-start :: JobDataManagerConfig -> IO Server
-start jdmCfg@JobDataManagerConfig{..} = do
-    heartbeat instanceManagerPort instanceManagerId  -- Start heartbeat
-    liteServer __MODULE__ serverConfigEx jobDataHandler jdmCfg
-```
+    forkIO $ do
+        tryWithMsg (takeMVar exitSignal >>= Core.exit)
+        -- if above throws, e.g. bad_alloc, just exit
+        Core.exit 1
 
-## Data Management
+    return $ do
+        "ping" $/ GET $. \r -> responseText "pong"
+        "exit" $/ GET $. \r -> do
+            putStrLn "Exit requested"
+            forkIO $ do
+                io $ Thread.sleep 5
+                Core.exit 0
+            return $ responseText "OK"
 
-### Data Unpacking Utilities
-```haskell
-unpackTasks = Stream.unstreamValueByteString . unWrappedTaskArray
-unpackClosure = Stream.unstreamValueByteString . unWrappedClosure
-```
-
-These functions convert stream-encoded job data into accessible formats.
-
-## HTTP API Endpoints
-
-### 1. `/fetch` - Job Data Fetching
-```haskell
-"fetch" $/ postValue $ \_ (FetchJobData (jobHost, jobPort, newJobId)) -> do
-    useOnce newJobId  -- Ensure JDM serves only one job
-    putMVar serverJobId newJobId
-    
-    -- Try to get job data from Job Manager or other JDMs
-    either (gotJDMs jobHost jobPort newJobId)  -- From other JDMs
-           (gotJobData)                        -- Direct from Job Manager
-        =<< JM.jdms (jobHost, jobPort) newJobId instanceManagerId
-                (JobDataManagerHost myAddr, JobDataManagerPort myPort)
-```
-
-### 2. `/closure` - Closure Data Access
-```haskell
-"closure" $/ GET $. \r -> do
-    serverJobId <- readMVar serverJobId
-    case r ?& "jobid" of
-        Just jobId -> if JobId jobId == serverJobId
-            then responseObject . toAny . fst <$> readMVar jobData
-            else printThenFail "Job ID mismatch"
-        _ -> printThenFail "Missing jobid argument"
-```
-
-### 3. `/task` - Individual Task Access
-```haskell
-"task" $/ GET $. \r -> do
-    serverJobId <- readMVar serverJobId
-    case (r ?& "jobid", r?& "taskid") of
-        (Just jobId, Just taskId) -> if JobId jobId == serverJobId
-            then responseObject . toAny
-                    . flip valueAnyIArray (read taskId)
-                    <$> readMVar tasks
-            else printThenFail "Job ID mismatch"
-        _ -> printThenFail "Missing arguments"
-```
-
-### 4. `/jobdata` - Complete Job Data Access
-```haskell
-"jobdata" $/ GET $. \r -> do
-    serverJobId <- readMVar serverJobId
-    case r ?& "jobid" of
-        Just jobId -> if JobId jobId == serverJobId
-            then responseObject . toAny <$> readMVar jobData
-            else printThenFail "Job ID mismatch"
-        _ -> printThenFail "Missing jobid argument"
-```
-
-## Client API Functions
-
-### 1. `fetch` - Initiate Job Data Fetching
-```haskell
-fetch :: JobDataManagerPort -> JobHost -> JobPort -> JobId -> IO ()
-fetch jdPort jobHost jobPort jobId = do
-    handle <- io clientHandle
-    post handle url (FetchJobData (jobHost, jobPort, jobId)) [] opts
+statusMonitor exitSignal cfg WorkerOptions{..} handle = do
+    backoff True 2 2.0 10.0
+        (InstanceManager.isJobValid handle worker_instancePort worker_jobId)
+      >>= either (gotError exitSignal worker_id workerPort worker_jobId)
+                 (gotStatus)
     where
-    opts = noproxy |+| TimeOut (30 * 60) |+| KeepAlive False  -- 30min timeout
-    url = "http://127.0.0.1:" ++ show (unJobDataManagerPort jdPort) ++ "/fetch"
-```
+    workerPort = WorkerPort $ port cfg
+    gotStatus b = unless b $ do
+        putStrTs $ unwords
+            [ "jobid", unJobId worker_jobId
+            , "worker", unWorkerId worker_id
+            , "on port", show workerPort
+            , "failed to verify job status" ]
+        void $ tryPutMVar exitSignal 1
 
-### 2. `closure` - Retrieve Closure Data
-```haskell
-closure :: JobDataManagerPort -> JobId -> IO (Object IFunction)
-closure jdPort jobId = do
-    handle <- io clientHandle
-    unpackClosure <$> get handle url [] opts
+processTask exitSignal cfg WorkerOptions{..} handle closure prev = do
+    let needClosure = isNothing closure
+        prevResult = fmap f prev where
+            f (tid, info, r) = (tid, (info, WrappedResult $ Stream.streamValueByteString r))
+        workRequest = timeIt (worker_debug >= DebugNormal)
+                             (unwords
+                                [ "jobid", unJobId worker_jobId
+                                , "worker", unWorkerId worker_id
+                                , "on port", show workerPort
+                                , "task request" ])
+            $ do
+                requestNewTask <- case worker_memLimit of
+                    Nothing -> return True
+                    Just limit -> do
+                        usage <- io Core.peakUsage
+                        if usage > limit
+                        then do
+                            putStrTs $ unwords
+                                [ "jobid", unJobId worker_jobId
+                                , "worker", unWorkerId worker_id
+                                , "on port", show workerPort
+                                , "peak memory usage", show usage
+                                , "exceeds limit", show limit ]
+                            return False
+                        else do
+                            putStrTs $ unwords
+                                [ "jobid", unJobId worker_jobId
+                                , "worker", unWorkerId worker_id
+                                , "on port", show workerPort
+                                , "peak memory usage", show usage
+                                , "within limit", show limit ]
+                            return True
+                InstanceManager.work
+                    worker_id
+                    handle worker_instancePort
+                    worker_jobAddr worker_jobPort worker_jobId workerPort
+                    WorkerRequest {..}
+    when (worker_debug >= DebugLoud) $ putStrTs $ unwords
+            [ "jobid", unJobId worker_jobId
+            , "worker", unWorkerId worker_id
+            , "on port", show workerPort
+            , "is getting task"
+            , if needClosure then "and closure" else "" ]
+    try workRequest
+        >>= either (gotError exitSignal worker_id workerPort worker_jobId)
+                   (gotWork closure)
     where
-    opts = noproxy |+| TimeOut (30 * 60) |+| KeepAlive False
-    url = "http://127.0.0.1:" ++ show jdPort ++ "/closure?jobid=" ++ unJobId jobId
-```
+    workerPort = WorkerPort $ port cfg
+    gotWork _ (Nothing, _) = do
+        putStrTs $ unwords
+            [ "jobid", unJobId worker_jobId
+            , "worker", unWorkerId worker_id
+            , "on port", show workerPort
+            , "found no work" ]
+        tryPutMVar exitSignal 0
+        return $ Right ()
+    gotWork closure (Just (tid, arg), closure') = do
+        when (worker_debug >= DebugNormal) $ putStrTs $ unwords
+            [ "jobid", unJobId worker_jobId
+            , "worker", unWorkerId worker_id
+            , "on port", show workerPort
+            , "now runs task", show tid ]
+        cls <- case closure' <|> closure of
+            Nothing -> do
+                tryPutMVar exitSignal 1
+                fail $ unwords
+                    [ "jobid", unJobId worker_jobId
+                    , "worker", unWorkerId worker_id
+                    , "on port", show workerPort
+                    , "found no closure" ]
+            Just cls -> return cls
+        let (res, info) = evalWithInfo
+                            Nothing
+                            (Fun.try1 (Core.applyAny cls))
+                            arg
+        return $ Left (Just cls, Just (tid, info, res))
 
-### 3. `task` - Retrieve Specific Task
-```haskell
-task :: JobDataManagerPort -> JobId -> TaskId -> IO (Object IAny)
-task jdPort jobId taskId = do
-    handle <- io clientHandle
-    get handle url [] opts
-    where
-    opts = noproxy |+| TimeOut (30 * 60) |+| KeepAlive False
-    url = "http://127.0.0.1:" ++ show jdPort ++ "/task?jobid=" 
-           ++ unJobId jobId ++ "&taskid=" ++ show (unTaskId taskId)
-```
-
-### 4. `exit` - Graceful Shutdown
-```haskell
-exit :: JobDataManagerPort -> IO ()
-exit jdPort = void $ try $ io
-    $ HTTP.http [HTTP.proxy "", HTTP.timeout 300] HTTP.GET
-        ("http://127.0.0.1:" ++ show jdPort ++ "/exit") ""
-```
-
-## Key Features
-
-### 1. Single-Job Focus
-- Each JDM instance serves exactly one job (`useOnce` mechanism)
-- Prevents data contamination between different jobs
-- Ensures clean resource management
-
-### 2. Data Distribution
-- **Primary Source**: Fetches from Job Manager directly
-- **Fallback Source**: Can fetch from other JDMs if primary fails
-- **Efficient Access**: Provides direct access to closure and tasks
-
-### 3. Heartbeat Monitoring
-- Regular verification of parent Instance Manager availability
-- Automatic shutdown if parent becomes unavailable
-- Ensures JDMs don't run orphaned
-
-### 4. Performance Optimization
-- **Memory Mapping**: Efficient stream-based data handling
-- **Concurrent Access**: Supports multiple worker access patterns
-- **Caching**: In-memory caching of job data for fast access
-
-### 5. Error Handling
-- Comprehensive timeout management (30-minute timeouts)
-- Graceful degradation and fallback mechanisms
-- Clean shutdown procedures
-
-## Data Flow
-
-1. **Initialization**: JDM starts and establishes heartbeat with Instance Manager
-2. **Data Fetch**: Receives `/fetch` request to load specific job data
-3. **Data Serving**: Provides efficient access to closure and tasks via HTTP API
-4. **Monitoring**: Continuous heartbeat verification
-5. **Cleanup**: Graceful exit when job completes or parent becomes unavailable
-
-This Job Data Manager is a specialized component that provides high-performance, dedicated data serving for individual jobs in the Aquila distributed computing system, ensuring efficient data access while maintaining strict isolation between different jobs.
+gotError exitSignal worker_id workerPort worker_jobId err = do
+    tryPutMVar exitSignal 1
+    fail $ unwords
+        [ "jobid", unJobId worker_jobId
+        , "worker", unWorkerId worker_id
+        , "on port", show workerPort, "failed:", err ]
