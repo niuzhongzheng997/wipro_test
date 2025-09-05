@@ -1,112 +1,96 @@
-{-# LANGUAGE RecordWildCards #-}
--- Author: 1297892
--- Created on: 3/29/2016 6:32:35 PM
-module Cortex.Concurrent.Aquila.Trail
-    ( Server.Config(..)
-    , Server.Verbosity(..)
-    , Settings(..)
-    , Options(..)
-    , start
-    , startServer
-    , main
-    ) where
+This is the implementation of the Aquila Trail server, which appears to be a monitoring and tracking service for the Aquila distributed computation grid. Let me analyze this code:
 
-import Cortex.Data.HTTP.Server as Server
-import Cortex.Data.HTTP.Persistent as HTTP
-import Cortex.Concurrent.Aquila.Trail.Context
-import Cortex.Concurrent.Aquila.Trail.Database as Database
-import Cortex.Concurrent.Aquila.Trail.System as Sys
-import Cortex.Concurrent.Aquila.Utils as Utils
-import qualified Cortex.Data.DB.Connect as Connect
-import qualified Cortex.Stem.Stream as Stream
-import Cortex.Stem.Thread.Mu(sleep)
-import System.Console.CmdArgs.Explicit
-import System.Console.CmdArgs.Text
-import Control.Arrow
-import Control.Monad
-import Data.Default
+## Overall Purpose
 
+The Aquila Trail server is responsible for:
+- Tracking and monitoring Aquila computation grid activities
+- Storing job and task metadata in a database
+- Providing HTTP API endpoints for querying system status
+- Integrating with distribution managers
+
+## Core Data Structures
+
+### 1. Settings - Server Configuration
+```haskell
 data Settings = Settings
-    { createDatabase :: Bool
-    , sysSettings    :: Sys.SystemSettings
-    } deriving (Show)
+    { createDatabase :: Bool              -- Whether to create database on startup
+    , sysSettings    :: Sys.SystemSettings  -- System-specific settings
+    }
+```
 
-instance Default Settings where
-    def = Settings def def
-
-flags :: (String, String, [Flag Settings])
-flags = (,,) "Settings" "Aquila Trail Settings"
-    [ flagNone ["create-database"] (\x -> x{createDatabase=True}) "create the database before starting"
-    , flagReq ["dist-manager"] (\s x -> Right(x{sysSettings=def{Sys.distManager=Just (Utils.hostPortPair s)}}))
-        "HOST:PORT" "Aquila dist manager host:port"
-    ]
-
+### 2. Options - Complete Configuration
+```haskell
 data Options = Options
-    { serverOptions         :: Server.Config
-    , connectOptions        :: Connect.Options
-    , settings              :: Settings
-    } deriving (Show)
+    { serverOptions  :: Server.Config     -- HTTP server configuration
+    , connectOptions :: Connect.Options   -- Database connection options
+    , settings       :: Settings          -- Application settings
+    }
+```
 
+## Default Configuration
+
+```haskell
 instance Default Options where
     def = Options
-        { serverOptions = def { title = __MODULE__, nThreads = 256, backlog = Just 256, maxQueued = Just 256, port = 2907, safe = False, core = POCO, keepAliveConfig = Nothing }
-        , connectOptions = def
-            { Connect.dbms = Just Connect.PostgreSQL
-            , Connect.db = Just $ "Aquila.Trail." & show schemaVersion
-            }
+        { serverOptions = def { 
+            title = __MODULE__, 
+            nThreads = 256,               -- POCO thread pool size
+            backlog = Just 256,           -- Connection backlog
+            maxQueued = Just 256,         -- Maximum queued requests
+            port = 2907,                  -- Default port
+            safe = False, 
+            core = POCO,                  -- Using POCO networking core
+            keepAliveConfig = Nothing 
+          }
+        , connectOptions = def {
+            Connect.dbms = Just Connect.PostgreSQL,
+            Connect.db = Just $ "Aquila.Trail." & show schemaVersion
+          }
         , settings = def
         }
-        -- NOTE: nThreads: POCO uses a threadpool, nThreads is the maximum size of the pool
+```
 
-getOptions :: IO Options
-getOptions = do
-    (help,rest) <- processArgs optMode
-    case help of
-        Just (a,b) -> do
-            putStrLn $ showText b $ helpText a optMode
-            error "--help specified"    -- FIXME: better to terminate quitely
-        Nothing -> injectConnection rest
-  where
-    injectConnection :: Options -> IO Options
-    injectConnection opts = do
-        let ss = settings opts
-            sy = sysSettings ss
-        case Sys.distManager sy of
-          Just{} -> do
-              h <- io HTTP.clientHandle
-              return opts{ settings = ss{ sysSettings = sy
-                                            { Sys.handle = Just h }}}
-          Nothing -> return opts
+## Key Functions
 
-optMode :: Mode (Maybe (HelpFormat, TextFormat), Options)
-optMode = (mode "Aquila.Trail" (def,opt) "Run Aquila Trail Server" (flagArg (\v x -> error "no direct arguments permitted") "") [])
-            {modeGroupFlags=Group [flagHelpFormat (\a b (_,x) -> (Just (a,b),x))] [] $ map (second $ map remapSecond) gs
-            ,modeHelpSuffix=[]}
-    where gs = [ f Server.configFlags serverOptions (\v x -> v{serverOptions=x})
-               , f Connect.flags connectOptions (\v x -> v{connectOptions=x})
-               , f flags settings (\v x -> v{settings=x})
-               ]
-          opt = def
+### 1. Main Entry Point (`main`)
+```haskell
+main :: IO ()
+main = do
+    Options{..} <- getOptions              -- Parse command line options
+    connectOptions' <- case Connect.dbTrace connectOptions of
+        Connect.LogFile fn -> do           -- Set up database logging
+            s <- Stream.fileCreate fn
+            return $ connectOptions { Connect.dbTrace = Connect.Stream s }
+        _ -> return connectOptions
+    
+    (port, stop) <- start connectOptions' serverOptions settings  -- Start server
+    putStrLn $ unwords ["Started server at port", show port]
+    
+    () <- forever $ do io (sleep 10); return ()  -- Keep server running
+    stop `seq` return ()  -- Maintain reference to prevent GC
+```
 
-f :: (String,String,[Flag a]) -> (Options -> a) -> (Options -> a -> Options) -> (String, [Flag Options])
-f (name,desc,fs) proj embed = (name & ": " & desc, [remap (embed def) (proj &&& embed) x | x <- fs])
-
-remapSecond :: (Default b, Remap m) => m a -> m (b, a)
-remapSecond = remap (def,) (\(h,x) -> (x,(h,)))
-
+### 2. Server Startup (`start'`)
+```haskell
 start' :: (Config -> Handler () -> IO a) -> Connect.Options -> Server.Config -> Settings -> IO a
 start' run connectOptions serverOptions Settings{..} = do
-    ctx <- context connectOptions
-    Database.create connectOptions createDatabase
+    ctx <- context connectOptions          -- Create application context
+    Database.create connectOptions createDatabase  -- Create database if needed
+    
+    -- Initialize last event timestamp from database
     setLastEvent ctx =<< io (Database.lastTimeStamp =<< Connect.connect connectOptions)
+    
     run serverOptions $ do
-        Database.handler sysSettings ctx
+        Database.handler sysSettings ctx  -- Set up HTTP handlers
+```
 
--- | Start server with options in a separate thread.
+### 3. Server Management Functions
+```haskell
+-- Start server in separate thread
 startServer :: Connect.Options -> Server.Config -> Settings -> IO Server.Server
 startServer = start' runServer
 
--- | Start server with options in a separate thread. Returns server stop action.
+-- Start server and return port + stop action
 start :: Connect.Options -> Server.Config -> Settings -> IO (Int, IO ())
 start opts cfg stgs = do
     srv <- startServer opts cfg stgs
@@ -116,17 +100,52 @@ start opts cfg stgs = do
             stopServer srv
             waitForServer srv
     return (port, stop)
+```
 
-main :: IO ()
-main = do
-    Options{..} <- getOptions
-    connectOptions' <- case Connect.dbTrace connectOptions of
-        Connect.LogFile fn -> do
-            s <- Stream.fileCreate fn
-            return $ connectOptions { Connect.dbTrace = Connect.Stream s }
-        _ -> return connectOptions
-    (port, stop) <- start connectOptions' serverOptions settings
-    putStrLn $ unwords ["Started server at port", show port]
-    () <- forever $ do io (sleep 10); return ()
-    -- 'stop' is what keeps the server alive here by ensuring there is a reference pointing to it
-    stop `seq` return ()
+## Configuration Flags
+
+```haskell
+flags :: (String, String, [Flag Settings])
+flags = (,,) "Settings" "Aquila Trail Settings"
+    [ flagNone ["create-database"] (\x -> x{createDatabase=True}) 
+        "create the database before starting"
+    , flagReq ["dist-manager"] (\s x -> Right(x{sysSettings=def{Sys.distManager=Just (Utils.hostPortPair s)}}))
+        "HOST:PORT" "Aquila dist manager host:port"
+    ]
+```
+
+## Key Features
+
+### 1. Database Integration
+- Uses PostgreSQL database with versioned schema (`"Aquila.Trail." & show schemaVersion`)
+- Supports database creation on startup
+- Maintains event timestamps for synchronization
+
+### 2. HTTP Server
+- POCO-based HTTP server with 256 threads
+- Port 2907 by default
+- No keep-alive configuration (stateless)
+
+### 3. Distributed Integration
+- Can connect to Aquila distribution manager
+- Uses HTTP client for inter-service communication
+
+### 4. Command Line Processing
+- Comprehensive flag parsing using `cmdargs`
+- Support for help formatting
+- Database connection injection
+
+### 5. Context Management
+- Creates application context with database connection
+- Maintains last event timestamp for efficient querying
+
+## Workflow
+
+1. **Parse command line options** and configuration
+2. **Set up database logging** if configured
+3. **Create application context** and initialize database
+4. **Start HTTP server** with database handlers
+5. **Run indefinitely** until stopped
+6. **Provide clean shutdown** mechanism
+
+This server acts as the central monitoring and tracking service for the Aquila distributed computation system, storing metadata about jobs, tasks, and system status in a PostgreSQL database while providing HTTP APIs for querying this information.
