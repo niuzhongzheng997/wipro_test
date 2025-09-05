@@ -1,223 +1,227 @@
-{-|
-This is Aquila Instance Manager.
+This is the implementation of the Aquila Instance Manager, which is a critical component that manages individual compute instances in the Aquila distributed computing system. Let me analyze this code in detail:
 
-For more details on Aquila see "Cortex.Concurrent.Aquila"
--}
-{-# LANGUAGE LambdaCase, RecordWildCards #-}
-module Cortex.Concurrent.Aquila.InstanceManager
-    ( main
-    , InstanceOptions(..), serverConfig, flags, start
-    ) where
+## Overall Purpose
 
-import Control.Monad
-import Control.Concurrent
-import Control.Exception
-import Data.Maybe(isJust, isNothing)
-import System.Console.CmdArgs.Explicit
+The Aquila Instance Manager is responsible for:
+- Managing worker processes on individual compute nodes
+- Handling task execution and resource allocation
+- Communicating with Job Managers and other system components
+- Monitoring instance health and performance
+- Integrating with Trail service for monitoring
 
-import Cortex.Data.HTTP.Server
-import Cortex.Data.HTTP.Server.Config
-import Cortex.Concurrent.Aquila.InstanceManager.Internal
-import Cortex.Concurrent.Aquila.InstanceManager.Types
-import Cortex.Concurrent.Aquila.Types
-import Cortex.Concurrent.Aquila.Utils
-import Cortex.Temporal.Date.Mu(now, readDatetimeWithFormat)
-import qualified Cortex.Concurrent.Aquila.InstanceManager.JobDataManager as JDM
-import qualified Cortex.Concurrent.Aquila.Trail.Client as Trail
-import qualified Cortex.Concurrent.Aquila.Trail.Utils as Trail
-import qualified Cortex.Data.HTTP.Mu as HTTP
-import qualified Cortex.Stem.Core as Core
-import qualified Cortex.Stem.Thread.Mu as Thread
+## Core Configuration
 
+### InstanceOptions - Configuration
+```haskell
+data InstanceOptions = InstanceOptions
+    { distsDir       :: Maybe String    -- Path to Cortex distribution archives
+    , installDir     :: Maybe String    -- Directory to install Cortex dists
+    , nWorkers       :: Int             -- Number of workers on this instance
+    , minFreeMem     :: Double          -- Minimum free memory for job allocation
+    , memoryLimit    :: Maybe Double    -- Memory limit for workers
+    , maxLifetime    :: Double          -- Max instance lifetime in seconds
+    , messageWait    :: Int             -- Wait time between messages (seconds)
+    , debugLevel     :: Debug           -- Debug level
+    , manager        :: (ManagerHost, ManagerPort)  -- Grid manager address
+    , distManager    :: Maybe (String, Int)         -- Distribution manager
+    , trail          :: Maybe (String, Int)         -- Trail service address
+    , lotId          :: String          -- Unique cloud order identifier
+    }
+```
+
+## Server Configuration
+```haskell
 serverConfig :: Config
 serverConfig = def
     { title = __MODULE__
-    , nThreads = 1024
-    , backlog = Just 1024
-    , maxQueued = Just 1024
-    , port = 32200
+    , nThreads = 1024              -- Thread pool size
+    , backlog = Just 1024          -- Connection backlog
+    , maxQueued = Just 1024        -- Maximum queued requests
+    , port = 32200                 -- Default port
     , reuseAddr = False
     , safe = False
-    , core = POCO
+    , core = POCO                  -- POCO networking core
     , keepAliveConfig = Just KeepAlive
-        { keepAliveTimeout = 1 * 60 -- 1 minute
-        , keepAliveRequests = 0     -- infinity
+        { keepAliveTimeout = 1 * 60  -- 1 minute keep-alive
+        , keepAliveRequests = 0      -- Unlimited requests
         }
     }
+```
 
-flags :: [Flag InstanceOptions]
-flags =
-    [ flagReq ["dists"] (\s x -> Right (x { distsDir = Just s} ))
-        "PATH" "Path to Cortex distribution archives"
-    , flagReq ["install-dir"] (\s x -> Right (x { installDir = Just s} ))
-        "PATH" "Directory to install Cortex dists"
-    , flagReq ["slots"] (\s x -> Right (x { nWorkers = read s} ))
-        "INT" "Number of workers on this instance"
-    , flagReq ["min-free-memory"] (\s x -> Right x{minFreeMem=read s})
-        "DOUBLE" "Minimum number of free bytes to send job allocation request"
-    , flagReq ["memory-limit"] (\s x -> Right x{memoryLimit=Just (read s)})
-        "DOUBLE" "At-rest memory limit for workers"
-    , flagReq ["max-lifetime"] (\s x -> Right (x { maxLifetime = read s } ))
-        "DOUBLE" "Max lifetime in seconds. 0 for spot, n*3600 for n-hour spot block. Default to infinity."
-    , flagReq ["wait"] (\s x -> Right (x { messageWait = fromInt $ read s} ))
-        "INT" "Number of seconds to wait between messages to job manager"
-    , flagReq ["debug"] (\s x -> Right ( x { debugLevel = read s } ))
-        "DEBUG" "Debug level"
-    , flagReq ["manager"] (\s x -> Right (x { manager = parseManager s} ))
-        "HOST:PORT" "grid manager host:port"
-    , flagReq ["dist-manager"] (\s x -> Right (x { distManager = hp' s }))
-        "HOST:PORT" "dist manager host:port"
-    , flagReq ["trail"] (\s x -> Right (x { trail = hp' s }))
-        "HOST:PORT" "trail host:port"
-    , flagReq ["lot-id"] (\s x -> Right (x{lotId=s}))
-        "STRING" "unique identifier to relate to cloud order id"
-    ]
-    where
-    hp' = Just . hostPortPair
+## Key Initialization
 
-main :: IO ()
-main = serverMain start "InstanceManager" serverConfig flags
+### Server Startup
+```haskell
+start :: Config -> InstanceOptions -> IO Server
+start cfg instOpts@InstanceOptions{..} = runServer cfg =<< do
+    checkArgs instOpts  -- Validate configuration
+    
+    -- Create instance state management
+    instanceState <- newInstance cfg instOpts
+    let instanceManagerId = instanceId instanceState
+        jdmPort = jdmParent instanceState
+        
+    -- Configure Job Data Manager
+    let jdmOpts = (JDM.defJDMConfig jdmPort nJDMs)
+            { JDM.instanceManagerId = instanceManagerId
+            , JDM.instanceManagerPort = InstancePort (port cfg) }
+    
+    -- Start Job Data Manager
+    let startJDM = do
+            putStrTs $ unwords ["Start JDM on", show jdmPort]
+            waitForServer =<< JDM.start jdmOpts
+    
+    -- Start JDM with crash recovery
+    forkIO $ crashRecover 60 startJDM
+    
+    -- Main control loop
+    forkIO $ forever $ try (masterControl instanceState) >>= \case
+        Left e -> do
+            putStrTs $ unwords ["exception in master control thread:", e]
+            Core.exit 1
+        Right _ -> io $ Thread.sleep 5
+    
+    -- Trail service integration
+    whenJust trail . uncurry $ updateTrail instanceState lotId
+```
 
-checkArgs InstanceOptions{..} = do
-    when (isJust distsDir && isNothing installDir) $
-        fail "install-dir must be set if dists-dir is set"
+## Background Services
 
-    when (isJust distManager && not (isJust distsDir && isJust installDir)) $
-        fail "dists-dir and install-dir must be set if a dist-manager is used"
-
+### Trail Service Integration
+```haskell
 updateTrail instanceState lotId h p = do
     conn <- io $ Trail.connect h p
     (inst, usage) <- io $ Trail.mkInstanceInfo lotId
     myIPAddress <- io Core.getIPAddress
-
+    
+    -- Register instance with Trail
     tryWithMsg $ Trail.startInstance conn myIPAddress inst
-
+    
+    -- Background monitoring thread
     void $ forkIO $ flip loopM (usage, []) $ \(usage, perfs) -> do
         io $ Thread.sleep 5
-        tryWithMsg $ preemptCheck conn myIPAddress
-        updatePerf conn myIPAddress usage perfs
+        tryWithMsg $ preemptCheck conn myIPAddress  -- Check for termination
+        updatePerf conn myIPAddress usage perfs     -- Update performance metrics
+```
 
-    where
+### Preemption Check (Cloud Spot Instance)
+```haskell
+preemptCheck conn myIPAddr = do
+    -- AWS EC2 spot instance termination check
+    r <- try $ io $ HTTP.http_ [] HTTP.GET
+        "http://169.254.169.254/latest/meta-data/spot/termination-time" ""
+    case r of
+        Left e -> return ()
+        Right r -> case HTTP.responseCode r of
+            200 -> do  -- Termination notice received
+                terminationTime <- readTime $ HTTP.responseBody r
+                tryWithMsg $ stopInstance conn myIPAddr terminationTime
+            _ -> return ()
+```
 
-    preemptCheck conn myIPAddr
-        = either (const $ return ()) term =<< getTerminationNotice =<< io now
-        where
-        getTerminationNotice now = do -- FIXME take a vendor parameter for this
-            r <- try $ io $ HTTP.http_
-                [] HTTP.GET
-                "http://169.254.169.254/latest/meta-data/spot/termination-time"
-                ""
-            return $ case r of
-                Left e -> Left e
-                Right r -> case HTTP.responseCode r of
-                    200 -> Right $ readTime $ HTTP.responseBody r
-                    x -> Left $ unwords ["got error code", show x]
-            where
-            readTime = either (const now) id
-                     . readDatetimeWithFormat (Just "yyyy-mm-ddThh:nn:ssZ")
-        -- TODO update job manager
-        term = tryWithMsg . stopInstance conn myIPAddr
-        stopInstance conn myIPAddr instanceStopped = tryWithMsg
-            $ Trail.stopInstance conn myIPAddr
-                Trail.InstanceStop { termination = Trail.Terminated, ..}
+### Performance Monitoring
+```haskell
+updatePerf conn myIPAddress usage perfs = do
+    actives <- activeWorkers instanceState  -- Get active worker count
+    (perf, usage) <- io $ Trail.mkInstancePerf actives usage
+    
+    let perfs' = perf:perfs
+    if length perfs' > 6  -- Batch updates (30 seconds / 5 second intervals)
+    then do
+        tryWithMsg $ Trail.updateInstance conn $ map (myIPAddress,) perfs'
+        return (usage, [])
+    else
+        return (usage, perfs')
+```
 
-    updatePerf conn myIPAddress usage perfs = do
-        actives <- activeWorkers instanceState
-        (perf, usage) <- io $ Trail.mkInstancePerf actives usage
-        let perfs' = perf:perfs
-        if length perfs' > 30 `div` 5
-        then do
-            tryWithMsg $ Trail.updateInstance conn
-                       $ map (myIPAddress,) perfs'
-            return $ Left (usage, [])
-        else
-            return $ Left (usage, perfs')
+## HTTP API Endpoints
 
-{-
-checkInstanceMemory inst = do
-    avail <- instanceAvailMem inst
-    reserved <- instanceReservedMem inst
-    let total = instanceTotalMem inst
-    putStrTs $ unwords [ "instance memory:", show ( sipFormat total 0
-                                                  , sipFormat reserved 0
-                                                  , sipFormat avail 0 ) ]
-    when (avail < 0) $ do
-        putStrTs "available memory is negative. Exiting..."
-        Core.exit 1
-{-
-    when (abs (reserved + avail - total) > 0.05 * total) $ do
-        -- allowing some margin for accumulated arithmetic errors ...
-        putStrTs "reserved plus avail exceeding total memory. Exiting..."
-        Core.exit 2
--}
+### 1. `/work` - Worker Task Handling
+```haskell
+"work" $/ postValue $ \r request ->
+    case (r ?& "jobhost", r ?& "jobport", r ?& "jobid", 
+          r ?& "workerid", r ?& "workerport") of
+        (Just jobHost, Just jobPort, Just jobId, 
+         Just workerId, Just workerPort) ->
+            responseObject . toAny <$> workerRequest
+                    instanceState
+                    (JobHost jobHost) (read jobPort) (JobId jobId)
+                    (WorkerId workerId) (read workerPort) request
+        otherwise -> printThenFail "work: missing required parameters"
+```
 
--}
+**Functionality:**
+- Handles worker task requests and submissions
+- Validates all required parameters
+- Routes to appropriate worker handling logic
 
-start :: Config -> InstanceOptions -> IO Server
-start cfg instOpts@InstanceOptions{..} = runServer cfg =<< do
+### 2. `/imid` - Instance Identity Verification
+```haskell
+"imid" $/ GET $. \r -> case r ?& "imid" of
+    Just imid -> if InstanceManagerId imid == instanceManagerId
+        then return . responseObject $ toAny ()  -- Identity confirmed
+        else printThenFail $ unwords ["imid: mismatch", "expected", instanceManagerId, "got", imid]
+    Nothing -> printThenFail "imid: missing parameter"
+```
 
-    checkArgs instOpts
+**Functionality:**
+- Verifies instance manager identity
+- Security check for inter-service communication
 
-    instanceState <- newInstance cfg instOpts
-    let instanceManagerId = instanceId instanceState
-        jdmPort = jdmParent instanceState
-        jdmOpts = (JDM.defJDMConfig jdmPort nJDMs)
-            { JDM.instanceManagerId = instanceManagerId
-            , JDM.instanceManagerPort = InstancePort (port cfg) }
+### 3. `/isjobvalid` - Job Validation
+```haskell
+"isjobvalid" $/ GET $. \r -> case r ?& "jobid" of
+    Just jobId -> return . responseObject . toAny
+                        =<< isJobValid instanceState (JobId jobId)
+    Nothing -> printThenFail "isjobvalid: missing jobid parameter"
+```
 
-        startJDM = do
-            putStrTs $ unwords
-                [ "Start JDM on", show (unJobDataManagerPort jdmPort)
-                , "for", unInstanceManagerId instanceManagerId ]
-            waitForServer =<< JDM.start jdmOpts
+**Functionality:**
+- Checks if a job is still valid/running
+- Used by workers to validate task assignments
 
-    putStrTs $ unwords
-        [ "InstMan starting on port", show (port cfg)
-        , "with instance id", unInstanceManagerId instanceManagerId
-        , "with JDM on", show (unJobDataManagerPort jdmPort) ]
+### 4. `/exit` - Graceful Shutdown
+```haskell
+"exit" $/ GET $. \r -> do
+    Core.exit 0  -- Clean shutdown
+    return $ responseText "OK"
+```
 
-    -- Start JobDataManager and keep it running
-    forkIO $ crashRecover 60 startJDM
+## Key Features
 
-    forkIO $ forever $ try (masterControl instanceState) >>= \case
-        Left e -> do
-            putStrTs $ unwords ["exception in master control thread:", e ]
-            putStrTs "exiting"
-            Core.exit 1
-        Right _ -> do
-            io $ Thread.sleep 5
-            return ()
+### 1. Resource Management
+- **Worker Allocation**: Manages `nWorkers` concurrent worker processes
+- **Memory Management**: Enforces `minFreeMem` and `memoryLimit` constraints
+- **Lifetime Control**: Supports `maxLifetime` for spot instances
 
-    -- thread to keep Trail updated
-    whenJust trail . uncurry $ updateTrail instanceState lotId
+### 2. Fault Tolerance
+- **Crash Recovery**: `crashRecover` mechanism for JDM restarts
+- **Exception Handling**: Comprehensive error handling throughout
+- **Preemption Detection**: Automatic cloud spot instance termination detection
 
-    return $ do
-        "work" $/ postValue $ \r request ->
-            case (r ?& "jobhost", r ?& "jobport", r ?& "jobid", r ?& "workerid", r ?& "workerport") of
-                (Just jobHost, Just jobPort, Just jobId, Just workerId, Just workerPort) ->
-                    responseObject . toAny
-                        <$> workerRequest
-                                instanceState
-                                (JobHost jobHost) (read jobPort) (JobId jobId)
-                                (WorkerId workerId) (read workerPort) request
-                otherwise -> printThenFail $ unwords
-                        [ "work: missing required parameters." ]
+### 3. Monitoring Integration
+- **Trail Service**: Real-time performance monitoring and reporting
+- **Health Checks**: Regular instance health verification
+- **Performance Metrics**: Continuous resource usage tracking
 
-        "imid" $/ GET $. \r -> case r ?& "imid" of
-            Just imid -> if InstanceManagerId imid == instanceManagerId
-                then return . responseObject $ toAny ()
-                else printThenFail $ unwords
-                    [ "imid: expecting imid", unInstanceManagerId instanceManagerId
-                    , "got", imid ]
-            Nothing -> printThenFail $ unwords
-                    [ "imid: expecting imid", unInstanceManagerId instanceManagerId
-                    , "got Nothing"]
+### 4. Distributed Coordination
+- **Job Data Manager**: Manages distributed job data access
+- **Grid Manager Communication**: Coordinates with central management
+- **Worker Communication**: Handles task assignment and result collection
 
-        "isjobvalid" $/ GET $. \r -> case r ?& "jobid" of
-            Just jobId -> return . responseObject . toAny
-                                =<< isJobValid instanceState (JobId jobId)
-            Nothing -> printThenFail "isjobvalid: missing jobid parameter"
+### 5. Cloud Integration
+- **Spot Instance Support**: Handles cloud spot instance lifecycles
+- **Lot Identification**: `lotId` for cloud order correlation
+- **Termination Handling**: Graceful shutdown on preemption
 
-        "exit" $/ GET $. \r -> do
-            Core.exit 0
-            return $ responseText "OK"
+## Configuration Validation
+```haskell
+checkArgs InstanceOptions{..} = do
+    when (isJust distsDir && isNothing installDir) $
+        fail "install-dir must be set if dists-dir is set"
+    
+    when (isJust distManager && not (isJust distsDir && isJust installDir)) $
+        fail "dists-dir and install-dir must be set if a dist-manager is used"
+```
+
+This Instance Manager is a sophisticated component that transforms raw compute instances into managed workers within the Aquila distributed computing system, providing robust resource management, fault tolerance, and cloud integration capabilities.
