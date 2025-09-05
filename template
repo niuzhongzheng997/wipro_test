@@ -1,53 +1,318 @@
-Of course. Based on your precise clarification, here is the English explanation of the process flow.
+{-|
+This is Aquila Job Manager.
 
-### Process Flow Analysis
+For more details on Aquila see "Cortex.Concurrent.Aquila"
+-}
+{-# LANGUAGE RecordWildCards #-}
+module Cortex.Concurrent.Aquila.JobManager
+    ( main
+    , AqlConfig(..), ConfigEx(..), flags, serverConfigEx, start
+    ) where
 
-Your clarification is absolutely critical and correct. The process does not involve Aquila calling J5v3 directly. Instead, all API calls are routed through the Kong Gateway, which acts as a secure reverse proxy and single entry point.
+import Data.Default
 
-Here is the refined, accurate flow:
+import Cortex.Data.HTTP.Persistent
+import Cortex.Data.HTTP.Server
+import Cortex.Data.HTTP.Server.Config as Config
+import Cortex.Data.HTTP.Spawn.Lite
+import Cortex.Data.HTTP.Spawn.Types
+import Cortex.Data.String.Mu(sipFormat)
+import Cortex.Stem.Par.Resource
+import qualified Cortex.Stem.ByteString as BS
+import qualified Cortex.Stem.Core as Core
+import qualified Cortex.Stem.Thread.Mu as Thread
+import qualified Cortex.Temporal.Date as Date
 
----
+import Cortex.Concurrent.Aquila.JobManager.Internal
+import Cortex.Concurrent.Aquila.JobManager.JobTracker
+import Cortex.Concurrent.Aquila.Manager
+import Cortex.Concurrent.Aquila.Types
+import Cortex.Concurrent.Aquila.Utils
+import qualified Cortex.Concurrent.Aquila.Trail.Client as Trail
 
-### Refined Process Steps
+import Control.Concurrent
+import Control.Monad.Error
+import Data.IORef
+import Data.Traversable(traverse)
+import System.Console.CmdArgs.Explicit
 
-The process consists of two main phases: first obtaining a token, and then using it to make authorized API calls through the gateway.
+data AqlConfig = AqlConfig
+    { configex    :: ConfigEx
+    , debug       :: Debug
+    , retryLimit  :: Int
+    , taskTimeout :: Int
+    , clientTimeout :: Int
+    , manager     :: (ManagerHost, ManagerPort)
+    , trail       :: Maybe (String, Int)
+    }
+    deriving (Show)
 
-#### Phase 1: Token Acquisition (Authentication)
+instance Default AqlConfig where
+    def = AqlConfig serverConfigEx
+                    DebugNormal 5 (5 * 60) (5 * 60)
+                    (ManagerHost "127.0.0.1", ManagerPort 31999)
+                    Nothing
 
-1.  Aquila Requests Token from Kong:
-       The Aquila service sends an HTTPS request to a specific authentication endpoint on the Kong Gateway (e.g., `/oauth2/token`).
-       It provides its credentials (e.g., `client_id` and `client_secret`) to prove its identity.
+serverConfigEx :: ConfigEx
+serverConfigEx = def
+    { maxChildren = 950
+    , childThreads = 1024
+    , config =  def
+        { safe = False
+        , nThreads = 1024 -- maximum threadpool size for POCO
+        , maxQueued = Just 1024
+        , port = 32000
+        , reuseAddr = False
+        , title = __MODULE__
+        , core = POCO
+        , keepAliveConfig = Just Config.KeepAlive
+            { keepAliveTimeout = 1 * 60 -- 1 minute
+            , keepAliveRequests = 0     -- infinity
+            }
+        }
+    }
 
-2.  Kong Validates and Issues Token:
-       Kong receives the request. An authentication plugin (e.g., OAuth 2.0, JWT) validates Aquila's credentials.
-       If valid, Kong generates and returns an Access Token to Aquila.
+flags :: [Flag AqlConfig]
+flags =
+    [ flagReq ["manager"]
+        (\s x -> Right ( x { manager = parseManager s }))
+        "HOST:PORT" "Aquila grid manager host:port"
+    , flagReq ["retry-limit"]  (\s x -> Right ( x { retryLimit = read s}))
+        "INT" "Maximum number of retries"
+    , flagReq ["task-timeout"] (\s x -> Right ( x { taskTimeout = read s}))
+        "INT" "Number of seconds to wait before timing out a task"
+    , flagReq ["client-timeout"] (\s x -> Right ( x { clientTimeout = read s}))
+        "INT" "Number of seconds to wait before timing out a client"
+    , flagReq ["debug"]        (\s x -> Right ( x { debug = read s}))
+        "DEBUG" "Debug level"
+    , flagReq ["trail"] (\s x -> Right ( x { trail = Just $ hostPortPair s}))
+        "HOST:PORT" "Aquila Trail host:port"
+    ]
 
-#### Phase 2: API Call via Gateway (Authorization & Proxy)
+main :: IO ()
+main = do
+    let conf = def :: AqlConfig
+    liteServerMain __MODULE__ (configex conf) jobHandler flags
 
-3.  Aquila Calls the API through Kong:
-       Aquila needs to order or delete an instance by calling the J5v3 API.
-       Crucially, it does not call J5v3's internal address. Instead, it constructs a request to Kong's public API endpoint (e.g., `https://api.company.com/j5v3/instances`).
-       It places the received Access Token in the `Authorization` header of this request (e.g., `Authorization: Bearer <access_token>`).
+start :: ConfigEx -> AqlConfig -> IO Server
+start cfgEx aqlConfig = liteServer __MODULE__ cfgEx jobHandler aqlConfig
 
-4.  Kong Validates the Token and Proxies the Request:
-       Kong receives the request destined for its `/j5v3` endpoint.
-       Routing: Kong identifies, based on the path, that this request should be routed to the upstream J5v3 service.
-       Authentication & Authorization: Before proxying, a Kong plugin (e.g., JWT, OAuth2) intercepts the request:
-           It validates the signature and expiry of the Access Token.
-           (Optional) It checks if the token has permissions to perform the specific action (e.g., `DELETE` on `/instances`).
-       Proxy: Only if all checks pass, Kong forwards the now-verified request to the actual, internal J5v3 service.
+errorToTrail trail taskFailed msg jobId taskIds = whenJust trail $ \trail -> do
+    let (taskError, taskReschedule)
+            = maybe ("task rescheduled", True) (, False) msg
+        finish tid = (unJobId jobId, unTaskId tid, Trail.TaskFail{..})
+    unless (null taskIds) $ tryWithMsg
+        $ Trail.failTask trail $ map finish taskIds
+    whenJust msg $ const $ tryWithMsg
+        $ Trail.finishJob trail (unJobId jobId) $ Trail.JobPerf taskFailed msg
 
-5.  J5v3 Processes the Request:
-       J5v3 receives the request from Kong. It trusts that Kong has already handled authentication, so it can focus purely on business logic (e.g., deleting the instance).
-       It sends a response back to Kong, which is then relayed back to the original caller, Aquila.
+printErrorType' NoJobId{} = return ()
+printErrorType' x = printErrorType x
 
----
+jobHandler :: AqlConfig -> SessionToken -> String -> Int -> IO (Handler ())
+jobHandler myCfg@AqlConfig{..} token user myPort = do
+    putStrTs $ unwords [ "JobManager started on port", show myPort
+                       , "with config", show myCfg ]
 
-### Architectural Significance (Why This Matters)
+    myAddr <- io Core.getIPAddress
 
-This pattern is a cornerstone of modern microservices architecture:
+    jobTracker <- newJobTracker (JobHost myAddr) (JobPort myPort)
 
-   Single Entry Point: Kong acts as the front door for all API traffic. No client needs to know the internal network addresses of backend services.
-   Decoupling: The Aquila service is completely decoupled from the J5v3 service. It only needs to know Kong's address. Changes to J5v3's location or implementation do not require updates to Aquila.
-   Centralized Security: Security policies (auth, rate limiting, logging) are enforced in one place (Kong), rather than being duplicated across every backend service like J5v3. This is more robust and easier to manage.
-   Client Consistency: For any client like Aquila, the method to call any service is identical: "Call the Kong endpoint and add the token."
+    trailConn <- io $ traverse (uncurry Trail.connect) trail
+
+    managerHandle <- io clientHandle
+
+    -- Client heartbeat
+    lastHeartbeat <- newIORef =<< io Date.now
+    let clientHeartbeat = writeIORef lastHeartbeat =<< io Date.now
+
+    let cancelJob jobId now msg = do
+            jobUpdateStatus jobTracker ShuttingDown
+            putStrTs $ unwords ["jobid", unJobId jobId, msg]
+            -- Inform grid manager
+            tryWithMsg $ jobFinished managerHandle manager jobId
+            -- Update tasklist and trail
+            let update = errorToTrail trailConn now (Just msg) jobId
+            either printErrorType update
+                =<< runErrorT (jobCancelTasks jobTracker jobId now)
+
+    -- check that client submits job, and watch client heartbeats
+    forkIO $ do
+        let timeout = do
+                putStrTs $ unwords
+                    [ "JobManager on port", show myPort
+                    , "timed out waiting for submit" ]
+                Core.exit (-1)
+
+            gotJob jobId = forever $ do
+                now <- io Date.now
+                last <- readIORef lastHeartbeat
+                when (Date.datetimeDiff last now > limit) $ do
+                    cancelJob jobId now "client heartbeat expired"
+                    Core.exit (-1)
+                io $ Thread.sleep 20
+
+            -- client heartbeat limit for now: 5 minutes
+            -- FIXME make this an option
+            limit = fromInt clientTimeout / 60 / 60 / 24
+
+        -- wait for client to call submit
+        -- 'gotJob' will then run a thread to watch client heartbeats
+        maybe timeout gotJob =<< tryGetJobId jobTracker (clientTimeout * 1000)
+
+    -- Provide job progress to grid manager, serve as heartbeats too
+    forkIO $ forever $ do
+        let update p = tryWithMsg . jobProgress managerHandle manager
+                     =<< (fmap (updateJobProgress p) (getJob jobTracker))
+        either printErrorType' update
+            =<< runErrorT . jobTasksProgress jobTracker =<< io Date.now
+        io $ Thread.sleep 60
+
+    -- watch workers updates
+    forkIO $ forever $ do
+        myJobId <- getJobId jobTracker
+        now <- io Date.now
+        let update TaskListHealth{..}
+                | null tlh_killed = -- tell trail about the rescheduled tasks
+                    errorToTrail trailConn now Nothing myJobId tlh_rescheduled
+                | otherwise = do -- cancel the job and send error to client
+                    cancelJob myJobId now "tasks exceeded maximum retries"
+                    jobWriteError jobTracker (TasksKilled tlh_killed)
+        either printErrorType' update
+            =<< runErrorT (jobHealth jobTracker now taskTimeout retryLimit)
+        io $ Thread.sleep 10
+
+    return $ do
+        -- Accept work from front end
+        "submit" $/ postValue $
+            \r js@JobSubmission{submission_metadata=JobMetadata{..},..} ->
+          do
+            verifySessionToken token r
+            clientHeartbeat
+
+            started <- io Date.now
+
+            submitted_job <- either (printThenFail . show) return
+                =<< runErrorT (jobSubmit jobTracker started js)
+
+            msg <- jobStarted managerHandle manager submitted_job
+            whenJust msg printThenFail
+
+            when (debug >= DebugNormal) $ putStrTs $ unwords
+                [ "submitted", show (job_id, job_session, job_version)
+                , "on port", show myPort
+                , "number of tasks", show job_ntodo
+                , "max task memory"
+                , sipFormat (job_largestTaskMem submitted_job) 0 ]
+
+
+            -- If this fails Trail won't know about the job
+            whenJust trailConn $ \conn -> tryWithMsg $ do
+                let mkTaskInfo resource = Trail.TaskInfo
+                        { taskTime = computeTime resource
+                        , taskMemory = maxMemory resource }
+                    f = fromIntegral . BS.size
+                Trail.startJob conn (unJobId job_id) Trail.JobInfo
+                    { jobName = job_session
+                    , jobUser = job_user
+                    , account = job_account
+                    , version = unCortexVersion job_version
+                    , taskCount = job_ntodo
+                    , closureSize = f $ unWrappedClosure submission_closure
+                    , tasksSize = f $ unWrappedTaskArray submission_taskArray
+                    , taskInfo = map (mkTaskInfo . snd)
+                        (job_available $ job_progress submitted_job)
+                    , jobStarted = started }
+
+            return $ responseText "OK"
+
+        -- serve job data to instance job data managers
+        "jdms" $/ GET $. \r -> do
+            let serve jd = do
+                    myJobId <- getJobId jobTracker
+                    case jd of
+                        Right _ -> when (debug >= DebugNormal)
+                            $ putStrTs $ unwords
+                            [ "jobid", unJobId myJobId
+                            , "no JDMs, serving closure and task array"
+                            , "to instance", r !& "jdmhost" ]
+                        Left jdms -> when (debug >= DebugNormal)
+                            $ putStrTs $ unwords
+                            [ "jobid", unJobId myJobId
+                            , "forwarding instance", r !& "jdmhost"
+                            , "to JDMs", show jdms ]
+                    return . responseObject $ toAny jd
+            now <- io Date.now
+            either (printThenFail . show) serve
+                =<< runErrorT (requestJDMs jobTracker
+                       ( fmap JobId (r ?& "jobid") )
+                       ( InstanceManagerId (r !& "imid") )
+                       ( JDM ( JobDataManagerHost $ r !& "jdmhost"
+                             , JobDataManagerPort . read $ r !& "jdmport" ) )
+                       now )
+
+        "jobdata" $/ GET $. \r -> do
+            let serve jd = do
+                    myJobId <- getJobId jobTracker
+                    when (debug >= DebugNormal) $ putStrTs $ unwords
+                        [ "jobid", unJobId myJobId
+                        , "serving closure and task array immediately"
+                        , "to instance", r !& "inst" ]
+                    return . responseObject $ toAny jd
+            either (printThenFail . show) serve
+                =<< runErrorT (requestJobData jobTracker
+                                              (JobId <$> (r ?& "jobid")))
+
+        -- client heartbeating and partial result collection
+        -- FIXME client to send jobid over, job manager to verify it
+        "collect" $/ GET $. \r -> do
+            verifySessionToken token r
+            clientHeartbeat
+            either (printThenFail . show)
+                   (return . responseObject . toAny)
+                =<< runErrorT (jobCollect jobTracker)
+
+{- Ping actually works when implemented in Cortex.Data.HTTP.Spawn.Lite.
+-- It does not work here in this handler.
+-- import qualified Cortex.Data.Version as Version
+        "ping" $/ GET $. \_ -> do
+            v <- io Core.versionLong
+            when (debug >= DebugNormal) $ putStrTs $ unwords
+                     [ "received a ping,"
+                     , "respond based on", v ]
+            return $ responseObject
+                   $ toAny
+                   $ fromMaybe (Version.Version (Date.date 1900 01 01)
+                                                "s000000" "(unreal)")
+                               (Version.parseVersion v)
+-}
+
+        "jmwork" $/ postValue $ \r request -> withJobStatus jobTracker
+            $ \myStatus -> if myStatus == ShuttingDown
+                then
+                    printThenFail "job manager is shutting down."
+                else do
+                    now <- io Date.now
+                    either (printThenFail . show)
+                           (return . responseObject . toAny . fst)
+                        =<< runErrorT (jobWork trailConn
+                                               (Just (managerHandle, manager))
+                                               debug
+                                               jobTracker
+                                               (fmap JobId (r ?& "jobid"))
+                                               now
+                                               request
+                                      )
+
+        -- Kill
+        "kill" $/ GET $. \r -> do
+            myJobId <- getJobId jobTracker
+            now <- io Date.now
+            cancelJob myJobId now "explicitly killed"
+
+            --  exit
+            forkIO $ do
+                io $ Thread.sleep 10
+                Core.exit 0
+
+            return $ responseObject $ toAny ()
