@@ -1,151 +1,243 @@
-This is the implementation of the Aquila Trail server, which appears to be a monitoring and tracking service for the Aquila distributed computation grid. Let me analyze this code:
+{-|
+This is Aquila Grid Manager.
 
-## Overall Purpose
+For more details on Aquila see "Cortex.Concurrent.Aquila"
+-}
+{-# LANGUAGE LambdaCase, RecordWildCards #-}
+module Cortex.Concurrent.Aquila.Manager
+    ( main
+    , jobStarted, jobProgress, jobFinished, jobAlloc
+    , ManagerOptions(..), start, serverConfig, flags
+    ) where
 
-The Aquila Trail server is responsible for:
-- Tracking and monitoring Aquila computation grid activities
-- Storing job and task metadata in a database
-- Providing HTTP API endpoints for querying system status
-- Integrating with distribution managers
+import Control.Concurrent
+import Control.Concurrent.MVar
+import Control.Exception
+import Control.Monad
+import Data.Default
+import Data.List(sortBy, sortNub)
+import Data.Ord(comparing)
+import Data.Traversable(traverse)
+import System.Console.CmdArgs.Explicit
 
-## Core Data Structures
+import Cortex.Concurrent.Aquila.Manager.JobAllocation as JA
+import Cortex.Concurrent.Aquila.Types
+import Cortex.Concurrent.Aquila.Utils
+import Cortex.Data.HTTP.Persistent
+import Cortex.Data.HTTP.Server as Server
+import Cortex.Data.String.Mu(sipFormat)
+import qualified Cortex.Data.String.Mu as Str
+import qualified Cortex.Stem.Core as Core
+import qualified Cortex.Stem.Thread.Mu as Thread
+import qualified Cortex.Temporal.Date as Date
+import qualified Cortex.Concurrent.Aquila.DistManager.Client as DistManager
+import qualified Cortex.Concurrent.Aquila.Trail.Client as Trail
 
-### 1. Settings - Server Configuration
-```haskell
-data Settings = Settings
-    { createDatabase :: Bool              -- Whether to create database on startup
-    , sysSettings    :: Sys.SystemSettings  -- System-specific settings
-    }
-```
+-- Manager options
+data ManagerOptions = ManagerOptions
+    { distManager     :: Maybe (String, Int)
+    , trail           :: Maybe (String, Int)
+    , debug           :: Debug
+    } deriving (Show)
 
-### 2. Options - Complete Configuration
-```haskell
-data Options = Options
-    { serverOptions  :: Server.Config     -- HTTP server configuration
-    , connectOptions :: Connect.Options   -- Database connection options
-    , settings       :: Settings          -- Application settings
-    }
-```
-
-## Default Configuration
-
-```haskell
-instance Default Options where
-    def = Options
-        { serverOptions = def { 
-            title = __MODULE__, 
-            nThreads = 256,               -- POCO thread pool size
-            backlog = Just 256,           -- Connection backlog
-            maxQueued = Just 256,         -- Maximum queued requests
-            port = 2907,                  -- Default port
-            safe = False, 
-            core = POCO,                  -- Using POCO networking core
-            keepAliveConfig = Nothing 
-          }
-        , connectOptions = def {
-            Connect.dbms = Just Connect.PostgreSQL,
-            Connect.db = Just $ "Aquila.Trail." & show schemaVersion
-          }
-        , settings = def
+instance Default ManagerOptions where
+    def = ManagerOptions
+        { distManager = Just ("localhost", 31998)
+        , trail = Nothing
+        , debug = DebugNormal
         }
-```
 
-## Key Functions
+serverConfig :: Server.Config
+serverConfig = def
+    { title = __MODULE__
+    , nThreads = 1024
+    , maxQueued = Just 1024
+    , port = 31999
+    , reuseAddr = False
+    , safe = False
+    , core = POCO
+    , keepAliveConfig = Nothing
+    }
 
-### 1. Main Entry Point (`main`)
-```haskell
-main :: IO ()
-main = do
-    Options{..} <- getOptions              -- Parse command line options
-    connectOptions' <- case Connect.dbTrace connectOptions of
-        Connect.LogFile fn -> do           -- Set up database logging
-            s <- Stream.fileCreate fn
-            return $ connectOptions { Connect.dbTrace = Connect.Stream s }
-        _ -> return connectOptions
-    
-    (port, stop) <- start connectOptions' serverOptions settings  -- Start server
-    putStrLn $ unwords ["Started server at port", show port]
-    
-    () <- forever $ do io (sleep 10); return ()  -- Keep server running
-    stop `seq` return ()  -- Maintain reference to prevent GC
-```
-
-### 2. Server Startup (`start'`)
-```haskell
-start' :: (Config -> Handler () -> IO a) -> Connect.Options -> Server.Config -> Settings -> IO a
-start' run connectOptions serverOptions Settings{..} = do
-    ctx <- context connectOptions          -- Create application context
-    Database.create connectOptions createDatabase  -- Create database if needed
-    
-    -- Initialize last event timestamp from database
-    setLastEvent ctx =<< io (Database.lastTimeStamp =<< Connect.connect connectOptions)
-    
-    run serverOptions $ do
-        Database.handler sysSettings ctx  -- Set up HTTP handlers
-```
-
-### 3. Server Management Functions
-```haskell
--- Start server in separate thread
-startServer :: Connect.Options -> Server.Config -> Settings -> IO Server.Server
-startServer = start' runServer
-
--- Start server and return port + stop action
-start :: Connect.Options -> Server.Config -> Settings -> IO (Int, IO ())
-start opts cfg stgs = do
-    srv <- startServer opts cfg stgs
-    port <- boundPort srv
-    let stop = do
-            putStrLn $ unwords ["Stopping server at port", show port]
-            stopServer srv
-            waitForServer srv
-    return (port, stop)
-```
-
-## Configuration Flags
-
-```haskell
-flags :: (String, String, [Flag Settings])
-flags = (,,) "Settings" "Aquila Trail Settings"
-    [ flagNone ["create-database"] (\x -> x{createDatabase=True}) 
-        "create the database before starting"
-    , flagReq ["dist-manager"] (\s x -> Right(x{sysSettings=def{Sys.distManager=Just (Utils.hostPortPair s)}}))
+flags :: [Flag ManagerOptions]
+flags =
+    [ flagReq ["dist-manager"] (\s x -> Right(x{distManager=Just(hostPortPair s)}))
         "HOST:PORT" "Aquila dist manager host:port"
+    , flagReq ["trail"] (\s x -> Right ( x { trail = Just $ hostPortPair s}))
+        "HOST:PORT" "Aquila Trail host:port"
+    , flagReq ["debug"]             (\s x -> Right (x { debug = read s } ))
+        "DEBUG" "Debug level"
     ]
-```
 
-## Key Features
+main :: IO ()
+main = serverMain start "Aquila Manager" serverConfig flags
 
-### 1. Database Integration
-- Uses PostgreSQL database with versioned schema (`"Aquila.Trail." & show schemaVersion`)
-- Supports database creation on startup
-- Maintains event timestamps for synchronization
+start :: Server.Config -> ManagerOptions -> IO Server
+start cfg ManagerOptions{..} = runServer cfg =<< do
 
-### 2. HTTP Server
-- POCO-based HTTP server with 256 threads
-- Port 2907 by default
-- No keep-alive configuration (stateless)
+    -- Contact the Dist server if specified
+    versions <- newMVar . pure . CortexVersion =<< io Core.version
 
-### 3. Distributed Integration
-- Can connect to Aquila distribution manager
-- Uses HTTP client for inter-service communication
+    distMan <- io clientHandle
 
-### 4. Command Line Processing
-- Comprehensive flag parsing using `cmdargs`
-- Support for help formatting
-- Database connection injection
+    let checkVers = do
+          supportedVers <- case distManager of
+              Just (addr, port) -> fmap (either (const []) id)
+                  $ try $ DistManager.available distMan addr port
+              otherwise -> return []
+          modifyMVar_ versions $ \vers -> do
+              let vers' | not (null supportedVers) = sortNub supportedVers
+                        | otherwise = vers
+              when (vers /= vers') $ putStrTs $ unwords
+                  [ "Supported versions:"
+                  , Str.intercalate ", " $ map unCortexVersion vers' ]
+              return vers'
 
-### 5. Context Management
-- Creates application context with database connection
-- Maintains last event timestamp for efficient querying
+    checkVers
 
-## Workflow
+    trailConn <- io $ traverse (uncurry Trail.connect) trail
 
-1. **Parse command line options** and configuration
-2. **Set up database logging** if configured
-3. **Create application context** and initialize database
-4. **Start HTTP server** with database handlers
-5. **Run indefinitely** until stopped
-6. **Provide clean shutdown** mechanism
+    -- Needs to be a list so that we can round-robin across calls to get jobs
+    jobAllocator <- JA.newJobAllocator 5 Nothing
 
-This server acts as the central monitoring and tracking service for the Aquila distributed computation system, storing metadata about jobs, tasks, and system status in a PostgreSQL database while providing HTTP APIs for querying this information.
+    let expireJobs = do
+            expired <- JA.jobExpired jobAllocator
+            unless (null expired) $ putStrTs $ unwords
+                [ "expired", show $ map unJobId expired ]
+            ts <- io Date.now
+            whenJust trailConn $ \trail -> forM_  expired $ \jobId -> do
+                let purge = Trail.finishJob trail (unJobId jobId)
+                          $ Trail.JobPerf ts (Just "job purged")
+                backoff False 3 1 10 purge >>= \case
+                    Left e -> putStrTs e
+                    Right () -> return ()
+
+    -- Keep supported versions up to date
+    forkIO $ forever $ do
+        tryWithMsg checkVers
+        tryWithMsg expireJobs
+        io $ Thread.sleep 60
+
+    return $ do
+
+        "jobStarted" $/ postValue
+                     $ \r job@Job{job_metadata=JobMetadata{..},..} ->
+          do
+            vers <- readMVar versions
+            if job_version `elem` vers
+            then do
+                JA.jobProgress jobAllocator job
+                when (debug >= DebugNormal) $ putStrTs $ unwords
+                    [ "started"
+                    , show ( job_user, job_id, job_version
+                           , job_addr, job_port
+                           , job_session, job_ntodo
+                           , sipFormat job_largestTaskMem 0) ]
+                return $ responseObject
+                       $ toAny (Nothing :: Maybe String)
+            else
+                return $ responseObject
+                       $ toAny (Just $ unwords [ "Version"
+                                               , unCortexVersion job_version
+                                               , "is not supported" ])
+
+        "jobProgress" $/ postValue
+          $ \r job@Job{job_progress=p@JobProgress{..}, ..} -> do
+            now <- io Date.now -- use local time to avoid clock skew
+            JA.jobProgress jobAllocator job{job_progress=p{job_lastSeen=now}}
+            when (debug >= DebugLoud) $ putStrTs $ unwords
+                [ "jobid", unJobId (job_id job_metadata)
+                , show (job_available, job_complete, job_allocated) ]
+            return $ responseObject $ toAny ()
+
+        "jobFinished" $/ GET $. \r ->
+            case r ?& "jobid" of
+                Just jid -> do
+                    JA.jobFinish jobAllocator (JobId jid)
+                    when (debug >= DebugNormal) $
+                        putStrTs $ unwords [ "finished", jid ]
+                    return $ responseObject $ toAny ()
+                _ -> printThenFail "jobFinished: missing jobid parameter"
+
+        "jobAlloc" $/ postValue $ \r allocRequest -> do
+            -- putStrTs $ "jobAlloc" & show allocRequest
+            now <- io Date.now
+            allocated <- JA.jobAllocations jobAllocator now allocRequest
+
+            when (DebugNormal <= debug && debug < DebugLoud
+                && not (null allocated))
+                $ putStrTs $ unwords
+                    [ "requested", show (freeWorkers allocRequest)
+                    , "allocated", show (length allocated), "tasks"
+                    , show $ map (\(_, AllocatedJob{..}) ->
+                                    ( aj_jobId
+                                    , aj_jobVersion
+                                    , aj_jobPort
+                                    , sipFormat (aj_jobMaxTaskMem) 0))
+                                 (sortNub allocated) ]
+            when (debug >= DebugLoud)
+                $ putStrTs $ unwords
+                    [ "requested", show allocRequest
+                    , "allocated", show (length allocated), "tasks"
+                    , show $ sortNub allocated ]
+
+            return $ responseObject $ toAny allocated
+
+--
+-- Job Info
+--
+        "jobs" $/ GET $. \r -> do
+            -- FIXME: The list is volatile, sort it first
+            info <- sortBy (comparing $ job_session . job_metadata)
+                 <$> JA.jobInfo jobAllocator
+            return $ responseText $ unlines $
+                ["Jobs : allocated - complete / available"
+                ,"---------------------------------------"
+                ] ++
+                (map (\Job { job_progress=JobProgress{..}
+                           , job_metadata=JobMetadata{..}
+                           , ..} -> unwords
+                        [ job_user, job_session, unJobId job_id
+                        , unCortexVersion job_version
+                        , unJobHost job_addr & ":" & show job_port
+                        , ":"
+                        , show job_allocated, "-", show job_complete
+                        , "/", show job_available
+                        ])
+                     info)
+
+        "exit" $/ GET $. \r -> do
+            Core.exit 0
+            return $ responseText "OK"
+
+----------------------------------------------------------------
+
+-- Manager client API
+
+opts = noproxy
+    |+| TimeOut (5 * 60)
+    |+| KeepAlive False
+
+jobStarted :: HTTPClient -> (ManagerHost, ManagerPort) -> Job -> IO (Maybe String)
+jobStarted handle (host, port) job = post handle url job [] opts
+    where url = mconcat [ "http://", unManagerHost host, ":", show port
+                        , "/jobStarted" ]
+
+jobProgress :: HTTPClient -> (ManagerHost, ManagerPort) -> Job -> IO ()
+jobProgress handle (host, port) job = post handle url job [] opts
+    where url = mconcat [ "http://", unManagerHost host, ":", show port
+                        , "/jobProgress"]
+
+jobFinished :: HTTPClient -> (ManagerHost, ManagerPort) -> JobId -> IO ()
+jobFinished handle (host, port) jobId = get handle url [] opts
+    where url = mconcat [ "http://", unManagerHost host, ":", show port
+                        , "/jobFinished?jobid=", unJobId jobId ]
+
+jobAlloc
+    :: HTTPClient
+    -> (ManagerHost, ManagerPort)   -- ^ server:
+    -> AllocationRequest -- ^ alloc request
+    -> IO [(Int, AllocatedJob)] -- ^ allocated jobs
+jobAlloc handle (host, port) alloc = post handle url alloc [] opts
+    where url = mconcat [ "http://", unManagerHost host, ":", show port
+                        , "/jobAlloc" ]
